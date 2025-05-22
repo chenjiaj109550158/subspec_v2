@@ -42,13 +42,15 @@ pip install -e .
 
 To evaluate the performance of SubSpec, you can use the provided `run.sh` script.
 ```eval
-bash run.sh <method path> run-benchmark --benchmarks <benchmarks> --max-samples 20
+bash run.sh <pipeline path> run-benchmark --benchmarks <benchmarks> --max-samples 20
 ```
+All experiment pipelines conducted in this work are located in the run/exp_offload directory.
 
 For example, to evaluate SubSpec on Qwen2.5 7B Instruct on MT-Bench and GSM8K, run:
 ```bash
 bash run.sh run.exp_offload.subspec_sd_qwen_7b run-benchmark --benchmarks mt-bench,gsm8k --max-samples 20
 ```
+
 There are a total of 9 selectable benchmarks:
 "mt-bench", "human-eval", "gsm8k", "alpaca", "cnn-dm", "aime", "gpqa", "math-500", and "livecodebench".
 
@@ -62,8 +64,11 @@ Below is the result for accelerating Qwen2.5 7B with tree-based speculative deco
 
 | Draft Model        | tokens/sec | τ |
 | ------------------ |---------------- | -------------- |
-| [EAGLE-2](https://huggingface.co/leptonai/EAGLE-Qwen2.57B-Instruct)      |      7.56        |      3.90      |
+| [EAGLE-2](https://huggingface.co/leptonai/EAGLE-Qwen2.5-7B-Instruct)      |      7.56        |      3.90      |
 | Qwen2.5 1.5B  |      15.14       |      11.91     |
 | SubSpec       |    **24.29**     |   **28.35**    |
 
 > τ represents average acceptance length, which is the the mean number of the accepted draft tokens per iteration.
+
+
+> For EAGLE's draft model, you will need to download the pretrained model manually, then convert it with the 'convert_eagle_weights.ipynb' script before use.
