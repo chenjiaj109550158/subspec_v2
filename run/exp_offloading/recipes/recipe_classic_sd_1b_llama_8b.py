@@ -13,7 +13,7 @@ class Recipe(QuantOffloadRecipe):
     
         # Offloading
         device_config = {}
-        start = 3 # First 3 layers are kept on GPU
+        start = 3 # The first 3 layers are kept on GPU
         end = layer_cnt
         for i in range(start, end):
             device_config[f"model.layers.{i}.self_attn.q_proj"] = 'cpu'

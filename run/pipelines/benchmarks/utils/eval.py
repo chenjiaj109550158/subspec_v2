@@ -140,7 +140,7 @@ def run_mtbench_eval(generator, tokenizer, past_key_values, draft_past_key_value
             tmp_exp_log['total_verify_time'] += generator.exp_log.get('avg_verify_time', 0) * n_iter
             
             exp_log = {**exp_log, tid: {**generator.exp_log, "query": query, "response": output_message, "peak_mem": torch.cuda.max_memory_reserved(args.device)/(1024**3)}}
-            messages.append({"role": "assistant", "content": output_message})
+            messages.append({"role": "system", "content": output_message})
             
             del input_ids, output_ids
             gc.collect()

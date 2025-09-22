@@ -61,6 +61,8 @@ class SubSpecSDGeneratorBase(ClassicSDGeneratorBase):
         if model_kwargs.get("past_key_values") is not None:
             past_key_values = model_kwargs["past_key_values"]
             max_cache_len = getattr(past_key_values, "max_cache_len", None)
+            
+            self.draft_model.set_past_key_values(past_key_values)
         else:
             raise ValueError("past_key_values is not provided")
 
@@ -76,6 +78,7 @@ class SubSpecSDGeneratorBase(ClassicSDGeneratorBase):
             next_token_logits = None
             for start in range(0, prefill_length, chunk_size):
                 chunk = prefill_tokens[:, start:start + chunk_size]
+                current_kv_len = past_key_values.get_seq_length()
                 cache_position = torch.arange(
                     current_kv_len, current_kv_len + chunk.size(1),
                     dtype=torch.long, device=input_ids.device
@@ -86,19 +89,21 @@ class SubSpecSDGeneratorBase(ClassicSDGeneratorBase):
                     self.target_model.model(
                         chunk,
                         past_key_values=past_key_values,
+                        position_ids=cache_position.unsqueeze(0),
                         cache_position=cache_position,
                     )
                 else:
                     outputs = self.target_model.prefill_forward(
                         chunk,
                         past_key_values=past_key_values,
+                        position_ids=cache_position.unsqueeze(0),
                         cache_position=cache_position,
                         logits_to_keep=1,
                     )
                     next_token_logits = outputs.logits
                     del outputs
-                    
-                current_kv_len = past_key_values.get_seq_length()
+                
+                past_key_values.seq_len += chunk.size(1)
 
         with nvtx.annotate("sample tokens"):
             sampled_tokens = self._sample_token(next_token_logits, logits_processor, do_sample)
@@ -113,7 +118,7 @@ class SubSpecSDGeneratorBase(ClassicSDGeneratorBase):
                 # * speculate
                 with nvtx.annotate("speculate", color="cyan"):
                     last_token_id = sampled_tokens[:, -1:].clone(memory_format=torch.contiguous_format)
-                    tree = self._speculate(last_token_id, past_key_values)
+                    tree = self._speculate(last_token_id)
 
                 # * tree decoding
                 with nvtx.annotate("tree_decoding", color="orange"):
@@ -134,7 +139,8 @@ class SubSpecSDGeneratorBase(ClassicSDGeneratorBase):
                 
                 with nvtx.annotate("reorder kv"):
                     past_key_values.reorder_cache_with_offset(hidden_indices, offset=prev_kv_len, new_chunk_len=self.draft_params.max_verify_tokens, dim=2)
-
+                    past_key_values.seq_len += hidden_indices.shape[0]
+                    
                 # * update input_ids and cache_position
                 with nvtx.annotate("update data"):
                     input_ids = torch.cat([input_ids, sampled_tokens], dim=-1)

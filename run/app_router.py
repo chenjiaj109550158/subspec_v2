@@ -40,6 +40,16 @@ def run_app(builder):
         """
         from .pipelines.run_benchmark import main as main_run_benchmark
         main_run_benchmark(builder, benchmarks=benchmarks, max_samples=max_samples)
+        
+    @app.command()
+    def run_benchmark_acc(benchmarks: str = None, max_samples: int = None):
+        """
+        Example subcommand for benchmarking.
+        Usage: 
+            python custom.py run-benchmark --bench-name=mt-bench
+        """
+        from .pipelines.run_benchmark_acc import main as main_run_benchmark_acc
+        main_run_benchmark_acc(builder, benchmarks=benchmarks, max_samples=max_samples)
 
     @app.command()
     def run_gradio():

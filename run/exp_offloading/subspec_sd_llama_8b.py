@@ -1,9 +1,9 @@
 import torch
 from run.app_router import run_app
-from run.offload.subspec_sd import SubSpecSDBuilder
+from subspec.run.subspec_sd import SubSpecSDBuilder
 from specdecodes.models.utils.utils import DraftParams
 
-from ..recipes.recipe_subspec_sd import Recipe
+from specdecodes.helpers.recipes.subspec.hqq_4bit_attn_4bit_mlp import Recipe
 
 class ExpSubSpecSDBuilder(SubSpecSDBuilder):
     def __init__(self):
@@ -16,7 +16,7 @@ class ExpSubSpecSDBuilder(SubSpecSDBuilder):
         self.max_length = 2048
         
         # Model paths.
-        self.llm_path = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
+        self.llm_path = "meta-llama/Llama-3.1-8B-Instruct"
         
         # Generation parameters.
         self.do_sample = False

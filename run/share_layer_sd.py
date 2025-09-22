@@ -1,6 +1,6 @@
 import logging
-from ..app_router import run_app
-from ..base_builder import GeneratorPipelineBuilder
+from .app_router import run_app
+from .base_builder import GeneratorPipelineBuilder
 
 import torch
 from specdecodes.models.utils.utils import DraftParams

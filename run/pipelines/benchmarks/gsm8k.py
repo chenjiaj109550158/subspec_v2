@@ -12,3 +12,15 @@ def load_gsm8k_dataset():
     dataset = load_dataset("openai/gsm8k", "main")
     formatted_dataset = [QUERY_TEMPLATE.format(Question=entry['question']) for entry in dataset['test']]
     return formatted_dataset
+
+def load_gsm8k_dataset_answer():
+    raw = load_dataset("openai/gsm8k", "main")['test']
+    examples = []
+    for entry in raw:
+        q_str = QUERY_TEMPLATE.format(Question=entry['question'])
+        a_str = entry['answer']
+        examples.append({
+            "question": q_str,
+            "answer": a_str
+        })
+    return examples

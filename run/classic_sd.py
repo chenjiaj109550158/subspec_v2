@@ -25,7 +25,9 @@ class ClassicSDBuilder(GeneratorPipelineBuilder):
         self.temperature = 0
         
         # Generator-specific configurations.
-        self.generator_kwargs = {}
+        self.generator_kwargs = {
+            "prefill_chunk_size": 256,
+        }
         self.draft_params = DraftParams(
             temperature=1,
             max_depth=8,

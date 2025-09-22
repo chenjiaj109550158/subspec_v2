@@ -13,11 +13,8 @@ class ClassicSDGeneratorBase(GeneratorBase):
         super().__init__(*model_args, **kwargs)
         self.prefill_chunk_size = generator_kwargs.get("prefill_chunk_size", None)
         
-    def _speculate(self, input_ids, past_key_values):
-        return self.draft_model.speculate(
-            input_ids,
-            past_key_values=past_key_values,
-        )
+    def _speculate(self, input_ids):
+        return self.draft_model.speculate(input_ids)
         
     def _init_tree_mask(self, max_verify_tokens, max_cache_len=None, device='cpu'):
         if not hasattr(self, 'tree_mask_update_method'):
@@ -42,17 +39,16 @@ class ClassicSDGeneratorBase(GeneratorBase):
     def _tree_decoding(self, tree, tree_mask, past_key_values, position_offset, cache_position, device):
         # Preparing target_model's tree decoding data, also updates each node's index (node.ind).
         with nvtx.annotate("create attn mask"):
-            node_data = tree.get_node_data()
+            node_data = tree.get_tree_data()
             tree_input_ids = node_data['token_ids']
             tree_position_ids = node_data['depths'] + position_offset
             tree_mask_partial = tree.create_attention_mask(position_offset)
         
         # Move to device
         with nvtx.annotate("mask to GPU"):
-            tree_input_ids = tree_input_ids.to(device, non_blocking=True)
-            tree_position_ids = tree_position_ids.to(device, non_blocking=True)
+            tree_input_ids = tree_input_ids.to(device)
+            tree_position_ids = tree_position_ids.to(device)
             tree_mask_partial = tree_mask_partial.to(device)
-            torch.cuda.synchronize()
         
         # Assing to tree mask
         with nvtx.annotate("update mask"):
@@ -90,7 +86,7 @@ class ClassicSDGeneratorBase(GeneratorBase):
         total_len = accept_len = 0
         
         # Iterate through draft tree, verify each node
-        node_data = tree.get_node_data()
+        node_data = tree.get_tree_data()
         token_ids = node_data['token_ids']  # (num_nodes,)
         cur_ind = torch.tensor([0], dtype=torch.long, device='cpu')  # start at root
         children_inds = tree.get_children_indices(cur_ind)
@@ -192,8 +188,9 @@ class ClassicSDGeneratorBase(GeneratorBase):
         if model_kwargs.get("past_key_values") is not None and model_kwargs.get("draft_past_key_values") is not None:
             past_key_values = model_kwargs["past_key_values"]
             max_cache_len = getattr(past_key_values, "max_cache_len", None)
-            
+
             draft_past_key_values = model_kwargs["draft_past_key_values"]
+            self.draft_model.set_past_key_values(draft_past_key_values)
         else:
             raise ValueError("past_key_values and draft_past_key_values should both be provided")
         
@@ -209,6 +206,7 @@ class ClassicSDGeneratorBase(GeneratorBase):
             next_token_logits = None
             for start in range(0, prefill_length, chunk_size):
                 chunk = prefill_tokens[:, start:start + chunk_size]
+                current_kv_len = past_key_values.get_seq_length()
                 cache_position = torch.arange(
                     current_kv_len, current_kv_len + chunk.size(1),
                     dtype=torch.long, device=input_ids.device
@@ -219,19 +217,21 @@ class ClassicSDGeneratorBase(GeneratorBase):
                     self.target_model.model(
                         chunk,
                         past_key_values=past_key_values,
+                        position_ids=cache_position.unsqueeze(0),
                         cache_position=cache_position,
                     )
                 else:
                     outputs = self.target_model.prefill_forward(
                         chunk,
                         past_key_values=past_key_values,
+                        position_ids=cache_position.unsqueeze(0),
                         cache_position=cache_position,
                         logits_to_keep=1,
                     )
                     next_token_logits = outputs.logits
                     del outputs
                 
-                current_kv_len = past_key_values.get_seq_length()
+                past_key_values.seq_len += chunk.size(1)
 
         with nvtx.annotate("sample tokens"):
             sampled_tokens = self._sample_token(next_token_logits, logits_processor, do_sample)
@@ -245,7 +245,8 @@ class ClassicSDGeneratorBase(GeneratorBase):
             while not finished:
                 # * speculate
                 with nvtx.annotate("speculate", color="cyan"):
-                    tree = self._speculate(input_ids, draft_past_key_values)
+                    input_ids = input_ids.clone(memory_format=torch.contiguous_format)
+                    tree = self._speculate(input_ids)
 
                 # * tree decoding
                 with nvtx.annotate("tree_decoding", color="orange"):
@@ -262,12 +263,13 @@ class ClassicSDGeneratorBase(GeneratorBase):
                                                         do_sample
                                                     )
                     
-                    sampled_tokens = sampled_tokens.to(input_ids.device, non_blocking=True)
+                    sampled_tokens = sampled_tokens.to(input_ids.device)
                     del next_token_logits
                 
                 with nvtx.annotate("reorder kv"):
                     past_key_values.reorder_cache_with_offset(hidden_indices, offset=prev_kv_len, new_chunk_len=self.draft_params.max_verify_tokens, dim=2)
-
+                    past_key_values.seq_len += hidden_indices.shape[0]
+                    
                 # * update input_ids and cache_position
                 with nvtx.annotate("update data"):
                     input_ids = torch.cat([input_ids, sampled_tokens], dim=-1)

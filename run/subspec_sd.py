@@ -1,6 +1,6 @@
 import logging
-from ..app_router import run_app
-from ..base_builder import GeneratorPipelineBuilder
+from .app_router import run_app
+from .base_builder import GeneratorPipelineBuilder
 
 import torch
 from specdecodes.models.utils.utils import DraftParams
@@ -33,7 +33,7 @@ class SubSpecSDBuilder(GeneratorPipelineBuilder):
         }
         self.draft_params = DraftParams(
             temperature=0.2,
-            max_depth=44,
+            max_depth=48,
             topk_len=6,
         )
         

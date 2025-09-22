@@ -201,16 +201,16 @@ class GeneratorPipelineBuilder:
                 dtype=self.dtype,
                 device=self.device,
             )
-
-            if target_config and target_config.get("quant_config"):
-                self.recipe.apply_quantization(model, target_config["quant_config"], self.dtype, self.device)
+            
             if draft_model and draft_config and draft_config.get("quant_config"):
                 self.recipe.apply_quantization(draft_model.model, draft_config["quant_config"], self.dtype, self.device)
+            if target_config and target_config.get("quant_config"):
+                self.recipe.apply_quantization(model, target_config["quant_config"], self.dtype, self.device)
 
-            if target_config and target_config.get("device_map"):
-                self.recipe.apply_offloading(model, target_config["device_map"])
             if draft_model and draft_config and draft_config.get("device_map"):
                 self.recipe.apply_offloading(draft_model.model, draft_config["device_map"])
+            if target_config and target_config.get("device_map"):
+                self.recipe.apply_offloading(model, target_config["device_map"])
 
         return model, draft_model, tokenizer
     

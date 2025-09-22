@@ -37,8 +37,8 @@ def main(builder):
             generator.profiling = is_profiling
 
     # input message
-    # input_message = "Do you know what is Beyblade? What is the best strategy to build the strongest Beyblade?"
-    input_message = "Describe what is large language models to me."
+    input_message = "Do you know what is Beyblade? What is the best strategy to build the strongest Beyblade?"
+    # input_message = "Describe what is large language models to me."
     messages = [{"role": "user", "content": input_message}]
     tokenizer.use_default_system_prompt = True
     input_ids = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True, return_tensors="pt").to(args.device)

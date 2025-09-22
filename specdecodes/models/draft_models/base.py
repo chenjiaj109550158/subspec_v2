@@ -3,7 +3,7 @@ import torch.nn as nn
 from transformers import AutoModelForCausalLM
 from transformers.utils import is_torchdynamo_compiling
 from safetensors.torch import load_model
-from typing import List, Tuple
+from typing import List, Tuple, Optional, Dict
 import logging
 import os
 import nvtx
@@ -29,14 +29,8 @@ def load_custom_model(model, model_path, remove_embeddings=False):
     return model
 
 class TreeData(nn.Module):
-    def __init__(self, root_id: int, sample_len: int, max_sample_depth: int, dtype: str, device: str):
+    def __init__(self):
         super().__init__()
-        self.root_id = root_id
-        self.sample_len = sample_len
-        self.max_sample_depth = max_sample_depth
-        self.dtype = dtype
-        self.device = device
-        
         self.token_ids_data = []
         self.child_probs_data = []
         self.parent_indices_data = []
@@ -47,12 +41,11 @@ class TreeData(nn.Module):
         self.parent_indices_data.append(parent_indices)
     
     def get_data(self):
-        self.token_ids_data = torch.cat(self.token_ids_data, dim=0).unsqueeze(0)
-        self.child_probs_data = torch.cat(self.child_probs_data, dim=0).unsqueeze(0)
-        self.parent_indices_data = torch.cat(self.parent_indices_data, dim=0).unsqueeze(0)
-        
-        return (self.token_ids_data, self.child_probs_data, self.parent_indices_data)
-
+        token_ids_data = torch.cat(self.token_ids_data, dim=0).unsqueeze(0)
+        child_probs_data = torch.cat(self.child_probs_data, dim=0).unsqueeze(0)
+        parent_indices_data = torch.cat(self.parent_indices_data, dim=0).unsqueeze(0)
+        return (token_ids_data, child_probs_data, parent_indices_data)
+    
 class TreeMaskCache:
     def __init__(self, prefix_len: int, sample_len: int, max_cache_len: int, dtype: str, device: str):
         self.prefix_len = prefix_len
@@ -85,10 +78,9 @@ class TreeMaskCache:
                 device=self.device,
                 dtype=torch.bool
             )
-
         # Create an identity block for later use
         self.eye_block = torch.eye(self.sample_len, device=self.device, dtype=torch.bool).unsqueeze(0).unsqueeze(0)
-    
+
     def update_tree_mask(self, parent_indices: torch.Tensor) -> torch.Tensor:
         if self.tree_mask_update_method == 'static': # static tree mask update
             # Update existing mask based on parent indices
@@ -103,6 +95,10 @@ class TreeMaskCache:
             self.tree_mask_cache = torch.concat((tree_mask, self.eye_block), dim=3)
         
         # Invert the mask and return
+        return invert_mask(self.tree_mask_cache, dtype=self.dtype)
+    
+    # return Inverted tree mask (same as update_tree_mask output)
+    def get_tree_mask(self):
         return invert_mask(self.tree_mask_cache, dtype=self.dtype)
 
 class DraftModelBase(nn.Module):
@@ -263,3 +259,9 @@ class DraftModelBase(nn.Module):
             token_ids = (topk_indices % vocab_size).long()  # Shape: [sample_k]
 
         return token_ids, topk_probs, parent_indices
+    
+    def set_past_key_values(self, past_key_values):
+        self.past_key_values = past_key_values
+        
+    def get_tree(self):
+        return self.tree

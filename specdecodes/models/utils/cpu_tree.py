@@ -24,6 +24,9 @@ class TreeNode:
         self.token_id = token_id
         self.cumulative_probability = cumulative_probability
         self.has_been_sampled = False
+        
+    def __repr__(self):
+        return f"TreeNode(token_id={self.token_id}, cumulative_probability={self.cumulative_probability:.4f}, depth={self.depth}, parent={self.parent})"
 
 
 class Tree:
@@ -73,11 +76,10 @@ class Tree:
         assert batch_size == 1, "Currently only batch_size=1 is supported."
 
         # Convert data to cpu and list
-        local_parent_indices = local_parent_indices.to('cpu', non_blocking=True)
-        token_ids = token_ids.to('cpu', non_blocking=True)
-        token_probs = token_probs.to('cpu', non_blocking=True)
-        
-        torch.cuda.synchronize()
+        local_parent_indices = local_parent_indices.to('cpu', non_blocking=False)
+        token_ids = token_ids.to('cpu', non_blocking=False)
+        token_probs = token_probs.to('cpu', non_blocking=False)
+
         local_parent_indices = local_parent_indices.tolist()
         token_ids = token_ids.tolist()
         token_probs = token_probs.tolist()
@@ -155,25 +157,47 @@ class Tree:
             if (not is_parent[i]) and (not node.has_been_sampled)
         ]
         return torch.tensor(keep_list, dtype=torch.long)
+    
+    def get_node(self, node_index: int) -> TreeNode:
+        if node_index < 0 or node_index >= self.current_size:
+            raise IndexError(f"Node index {node_index} out of bounds for tree size {self.current_size}.")
+        return self.nodes[node_index]
 
     def get_children_indices(self, node_index: int) -> torch.Tensor:
         return torch.tensor(self.nodes[node_index].children, dtype=torch.long, device='cpu')
+    
+    def get_children_ids(self, node_index: int) -> torch.Tensor:
+        return torch.tensor(
+            [self.nodes[c].token_id for c in self.nodes[node_index].children],
+            dtype=torch.long,
+            device='cpu'
+        )
+    
+    def find_child_index(self, node_index: int, match_token_id: int) -> Optional[int]:
+        for child_index in self.nodes[node_index].children:
+            if self.nodes[child_index].token_id == match_token_id:
+                return child_index
+        return None
 
-    def get_node_data(self) -> Dict[str, torch.Tensor]:
+    def get_tree_data(self, skip_nodes=0) -> Dict[str, torch.Tensor]:
         t_ids, probs, depths, parents = [], [], [], []
         for node in self.nodes:
             t_ids.append(node.token_id)
             probs.append(node.cumulative_probability)
             depths.append(node.depth)
             parents.append(node.parent if node.parent is not None else -1)
+            
+        # print("Skip nodes:", skip_nodes)
+        # print("\tBefore skip nodes:", t_ids)
+        # print("\tAfter skip nodes:", t_ids[skip_nodes:])
         return {
-            'token_ids': torch.tensor(t_ids, dtype=torch.long, device='cpu'),
-            'cumulative_probabilities': torch.tensor(probs, dtype=self.prob_dtype, device='cpu'),
-            'depths': torch.tensor(depths, dtype=torch.long, device='cpu'),
-            'parent_indices': torch.tensor(parents, dtype=torch.long, device='cpu'),
+            'token_ids': torch.tensor(t_ids[skip_nodes:], dtype=torch.long, device='cpu'),
+            'cumulative_probabilities': torch.tensor(probs[skip_nodes:], dtype=self.prob_dtype, device='cpu'),
+            'depths': torch.tensor(depths[skip_nodes:], dtype=torch.long, device='cpu'),
+            'parent_indices': torch.tensor(parents[skip_nodes:], dtype=torch.long, device='cpu'),
         }
         
-    def get_max_depth(self) -> torch.Tensor:
+    def get_depth(self) -> torch.Tensor:
         return torch.tensor(
             max((node.depth for node in self.nodes), default=0),
             dtype=torch.long,
@@ -183,7 +207,7 @@ class Tree:
     def size(self) -> int:
         return self.current_size
 
-    def create_attention_mask(self, prefix_length: int = 0, device: str = 'cpu') -> torch.Tensor:
+    def create_attention_mask(self, prefix_length: int = 0, skip_nodes: int = 0, device: str = 'cpu') -> torch.Tensor:
         n = self.current_size
         if n == 0:
             return torch.empty((1, 1, 0, prefix_length), dtype=self.prob_dtype, device=device)
@@ -200,11 +224,14 @@ class Tree:
         am_tensor = torch.tensor(ancestor_matrix, dtype=torch.bool, device=device)
         if prefix_length > 0:
             prefix = torch.ones((n, prefix_length), dtype=torch.bool, device=device)
+            # print("prefix mask shape:", prefix.shape, "am_tensor shape:", am_tensor.shape)
             am_tensor = torch.cat([prefix, am_tensor], dim=1)
+            # print("whole_am_tensor shape:", am_tensor.shape)
 
         # Convert to large negative for masking
         # neg_inf_mask = (~am_tensor).to(self.prob_dtype) * torch.finfo(self.prob_dtype).min
         # return neg_inf_mask.unsqueeze(0).unsqueeze(0)
+        am_tensor = am_tensor[skip_nodes:, :]
         return am_tensor.unsqueeze(0).unsqueeze(0)
     
     def print_tree_structure(self, show_token_id: bool = True, show_probability: bool = True, tokenizer=None):

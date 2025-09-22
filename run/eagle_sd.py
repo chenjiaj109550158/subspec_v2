@@ -14,6 +14,7 @@ class EagleSDBuilder(GeneratorPipelineBuilder):
         self.seed = 0
         self.device = "cuda:0"
         self.dtype = torch.float16
+        self.max_length = 2048
         
         # Model paths.
         self.llm_path = "meta-llama/Llama-3.1-8B-Instruct"

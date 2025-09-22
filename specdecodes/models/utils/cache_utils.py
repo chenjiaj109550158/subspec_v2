@@ -26,6 +26,11 @@ def create_kv_cache(
 class TreeDynamicCache(DynamicCache):
     def __init__(self) -> None:
         super().__init__()
+        # user should maintain seq_len manually when using this class
+        self.seq_len = 0
+    
+    def get_seq_length(self) -> int:
+        return self.seq_len
         
     def crop(self, start: int, end = None, dim=0):
         """Crop the past key/values up to a new `max_length` (negative removes from the end)."""
@@ -75,6 +80,7 @@ class TreeDynamicCache(DynamicCache):
         self._seen_tokens = 0  # Used in `generate` to keep tally of how many tokens the cache has seen
         self.key_cache: List[torch.Tensor] = []
         self.value_cache: List[torch.Tensor] = []
+        self.seq_len = 0
 
 
 class TreeStaticCache(StaticCache):
@@ -93,6 +99,19 @@ class TreeStaticCache(StaticCache):
             dtype=dtype,
             max_batch_size=max_batch_size,
         )
+        # user should maintain seq_len manually when using this class
+        self.seq_len = 0
+    
+    def get_seq_length(self) -> int:
+        return self.seq_len
+    
+    def reset(self):
+        """Resets the cache values while preserving the objects"""
+        for layer_idx in range(len(self.key_cache)):
+            # In-place ops prevent breaking the static address
+            self.key_cache[layer_idx].zero_()
+            self.value_cache[layer_idx].zero_()
+        self.seq_len = 0
 
     def crop(self, start: int, end: Optional[int] = None, dim: int = 2) -> None:
         """
@@ -155,18 +174,15 @@ class TreeStaticCache(StaticCache):
             b_idx = beam_idx.to(dev)
             reorder_src = offset + b_idx
             reorder_dest = offset + torch.arange(slice_len, device=dev)
-            leftover_range = (offset + torch.arange(slice_len, new_chunk_len, device=dev)
-                              if new_chunk_len > slice_len else None)
+            
             # Stack the caches for this device.
             k_cat = torch.stack([self.key_cache[i] for i in indices], dim=0)
             v_cat = torch.stack([self.value_cache[i] for i in indices], dim=0)
             # Batched update along dimension `dim`
             k_cat.index_copy_(dim+1, reorder_dest, k_cat.index_select(dim+1, reorder_src))
             v_cat.index_copy_(dim+1, reorder_dest, v_cat.index_select(dim+1, reorder_src))
-            if leftover_range is not None:
-                k_cat.index_fill_(dim+1, leftover_range, 0)
-                v_cat.index_fill_(dim+1, leftover_range, 0)
+            
             # Scatter the updated results back.
             for j, i in enumerate(indices):
-                self.key_cache[i].copy_(k_cat[j], non_blocking=True)
-                self.value_cache[i].copy_(v_cat[j], non_blocking=True)
+                self.key_cache[i].copy_(k_cat[j])
+                self.value_cache[i].copy_(v_cat[j])

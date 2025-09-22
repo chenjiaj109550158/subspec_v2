@@ -10,27 +10,25 @@ from ..utils.utils import DraftParams, invert_mask
 
 
 class EagleSDGeneratorBase(ClassicSDGeneratorBase):
-    def _speculate(self, input_ids, hidden_states, past_key_values):
+    def _speculate(self, input_ids, hidden_states):
         return self.draft_model.speculate(
             input_ids,
             hidden_states=hidden_states,
-            past_key_values=past_key_values,
         )
 
     def _tree_decoding(self, tree, tree_mask, past_key_values, position_offset, cache_position, device):
         # Preparing target_model's tree decoding data, also updates each node's index (node.ind).
         with nvtx.annotate("create attn mask"):
-            node_data = tree.get_node_data()
+            node_data = tree.get_tree_data()
             tree_input_ids = node_data['token_ids']
             tree_position_ids = node_data['depths'] + position_offset
             tree_mask_partial = tree.create_attention_mask(position_offset)
         
         # Move to device
         with nvtx.annotate("mask to GPU"):
-            tree_input_ids = tree_input_ids.to(device, non_blocking=True)
-            tree_position_ids = tree_position_ids.to(device, non_blocking=True)
+            tree_input_ids = tree_input_ids.to(device)
+            tree_position_ids = tree_position_ids.to(device)
             tree_mask_partial = tree_mask_partial.to(device)
-            torch.cuda.synchronize()
         
         # Assing to tree mask
         with nvtx.annotate("update mask"):
@@ -112,6 +110,7 @@ class EagleSDGeneratorBase(ClassicSDGeneratorBase):
             max_cache_len = getattr(past_key_values, "max_cache_len", None)
             
             draft_past_key_values = model_kwargs["draft_past_key_values"]
+            self.draft_model.set_past_key_values(draft_past_key_values)
         else:
             raise ValueError("past_key_values and draft_past_key_values should both be provided")
         
@@ -127,6 +126,7 @@ class EagleSDGeneratorBase(ClassicSDGeneratorBase):
             next_token_logits = None
             for start in range(0, prefill_length, chunk_size):
                 chunk = prefill_tokens[:, start:start + chunk_size]
+                current_kv_len = past_key_values.get_seq_length()
                 cache_position = torch.arange(
                     current_kv_len, current_kv_len + chunk.size(1),
                     dtype=torch.long, device=input_ids.device
@@ -151,7 +151,7 @@ class EagleSDGeneratorBase(ClassicSDGeneratorBase):
                     hidden_states = outputs.hidden_states[-1]
                     del outputs
                 
-                current_kv_len = past_key_values.get_seq_length()
+                past_key_values.seq_len += chunk.size(1)
 
         with nvtx.annotate("sample tokens"):
             sampled_tokens = self._sample_token(next_token_logits, logits_processor, do_sample)
@@ -165,7 +165,7 @@ class EagleSDGeneratorBase(ClassicSDGeneratorBase):
             while not finished:
                 # * speculate
                 with nvtx.annotate("speculate", color="cyan"):
-                    tree = self._speculate(input_ids, hidden_states, draft_past_key_values)
+                    tree = self._speculate(input_ids, hidden_states)
 
                 # * tree decoding
                 with nvtx.annotate("tree_decoding", color="orange"):
@@ -189,7 +189,8 @@ class EagleSDGeneratorBase(ClassicSDGeneratorBase):
                 
                 with nvtx.annotate("reorder kv"):
                     past_key_values.reorder_cache_with_offset(hidden_indices, offset=prev_kv_len, new_chunk_len=self.draft_params.max_verify_tokens, dim=2)
-
+                    past_key_values.seq_len += hidden_indices.shape[0]
+                    
                 # * update input_ids, hidden_states, and cache_position
                 with nvtx.annotate("update data"):
                     input_ids = torch.cat([input_ids, sampled_tokens], dim=-1)
@@ -201,7 +202,7 @@ class EagleSDGeneratorBase(ClassicSDGeneratorBase):
                     finished = stopping_criteria(input_ids, None).item()
                     
             # * draft kv missing last llm hidden_states for multi-turn tasks
-            self.draft_model.final_update(input_ids, hidden_states, draft_past_key_values)
+            self.draft_model.final_update(input_ids, hidden_states)
                 
         return input_ids
 

@@ -1,20 +1,22 @@
 import torch
 from run.app_router import run_app
-from run.vanilla import NaiveBuilder
+from subspec.run.subspec_sd import SubSpecSDBuilder
+from specdecodes.models.utils.utils import DraftParams
 
-from ..recipes.recipe_vanilla_llama_8b import Recipe
+from specdecodes.helpers.recipes.subspec.hqq_4bit_attn_4bit_mlp import Recipe
 
-class NaiveBuilder(NaiveBuilder):
+class ExpSubSpecSDBuilder(SubSpecSDBuilder):
     def __init__(self):
         super().__init__()
         # Base configurations.
-        self.vram_limit_gb = 8
+        self.vram_limit_gb = 24
+        self.seed = 0
         self.device = "cuda:0"
         self.dtype = torch.float16
         self.max_length = 2048
         
         # Model paths.
-        self.llm_path = "deepseek-ai/DeepSeek-R1-Distill-Llama-8B"
+        self.llm_path = "Qwen/Qwen2.5-32B-Instruct"
         
         # Generation parameters.
         self.do_sample = False
@@ -24,17 +26,19 @@ class NaiveBuilder(NaiveBuilder):
         self.generator_kwargs = {
             "prefill_chunk_size": 256,
         }
+        self.draft_params = DraftParams(
+            temperature=0.2,
+            max_depth=48,
+            topk_len=6,
+        )
         
         # Recipe for quantization and offloading.
         self.recipe = Recipe()
         
-        # Additional configurations. 
+        # Additional configurations.
         self.cache_implementation = "static"
-        self.warmup_iter = 1
-        self.compile_mode = None # Cannot compile under offload settings!
+        self.warmup_iter = 3
+        self.compile_mode = "max-autotune"
         
-        # Profiling
-        self.generator_profiling = True
-
 if __name__ == "__main__":
-    run_app(NaiveBuilder())
+    run_app(ExpSubSpecSDBuilder())

@@ -26,7 +26,7 @@ class NaiveGeneratorBase(GeneratorBase):
 
         # Clone input_ids
         input_ids = input_ids.clone()
-        batch_size, org_input_len = input_ids.shape
+        batch_size, input_len = input_ids.shape
         assert batch_size == 1, "Only support batch_size=1 for now."
 
         # Prepare kv-cache and cache position
@@ -43,7 +43,7 @@ class NaiveGeneratorBase(GeneratorBase):
             raise ValueError("past_key_values should be provided")
 
         kv_len = past_key_values.get_seq_length()
-        cache_position = torch.arange(kv_len, org_input_len, dtype=torch.long, device=input_ids.device)
+        cache_position = torch.arange(kv_len, input_len, dtype=torch.long, device=input_ids.device)
 
         # Prefill stage
         with nvtx.annotate("prefill", color="orange"):
@@ -52,7 +52,6 @@ class NaiveGeneratorBase(GeneratorBase):
             prefill_length = prefill_tokens.size(1)
             chunk_size = prefill_length if self.prefill_chunk_size is None else min(prefill_length, self.prefill_chunk_size)
             next_token_logits = None
-            
             for start in range(0, prefill_length, chunk_size):
                 chunk = prefill_tokens[:, start:start + chunk_size]
                 current_kv_len = past_key_values.get_seq_length()
@@ -79,6 +78,7 @@ class NaiveGeneratorBase(GeneratorBase):
                     )
                     next_token_logits = outputs.logits
                     del outputs
+                past_key_values.seq_len += chunk.size(1)
 
         with nvtx.annotate("sample tokens"):
             next_tokens = self._sample_token(next_token_logits, logits_processor, do_sample)
@@ -106,6 +106,7 @@ class NaiveGeneratorBase(GeneratorBase):
                 with nvtx.annotate("update data"):
                     input_ids = torch.cat([input_ids, next_tokens], dim=-1)
                     cache_position += 1
+                    past_key_values.seq_len += 1
 
                 with nvtx.annotate("stopping criteria"):
                     finished = stopping_criteria(input_ids, None)
