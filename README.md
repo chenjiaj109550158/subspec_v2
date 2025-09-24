@@ -13,14 +13,13 @@ conda create -n subspec python=3.11
 conda activate subspec
 ```
 
-Then, install [PyTorch 2.6.0](https://pytorch.org/get-started/previous-versions/) from the official website. 
+Then, install [PyTorch](https://pytorch.org/get-started/locally/) from the official website. 
 
 Install the rest of the base requirements:
 
 ```setup
 pip install -r requirements.txt
 ```
-> Newer versions are also supported, while the experiments in the paper were performed with these versions.
 
 You will need to install the additional libraries for quantization:
 
