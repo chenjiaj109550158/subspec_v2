@@ -385,10 +385,10 @@ class ClassicSDGeneratorBase(GeneratorBase):
                 with nvtx.annotate("reorder kv"):
                     num_new_tokens = self.draft_params.max_verify_tokens
                     request_kv_cache.reorder_cache_with_offset(hidden_indices, offset=prev_kv_len, num_new_tokens=num_new_tokens)
-                    print(f"draft_request_kv_cache seq_len before reorder: {draft_request_kv_cache.get_seq_length()}")
+                    #print(f"draft_request_kv_cache seq_len before reorder: {draft_request_kv_cache.get_seq_length()}")
                     draft_request_kv_cache.reorder_cache_with_offset(hidden_indices, offset=draft_request_kv_cache.get_seq_length(), num_new_tokens=num_new_tokens)
-                    print(f"draft_request_kv_cache seq_len after reorder: {draft_request_kv_cache.get_seq_length()}")
-                    input("Press Enter to continue...")
+                    #print(f"draft_request_kv_cache seq_len after reorder: {draft_request_kv_cache.get_seq_length()}")
+                    #input("Press Enter to continue...")
 
                 # * update input_ids and cache_position
                 with nvtx.annotate("update data"):
