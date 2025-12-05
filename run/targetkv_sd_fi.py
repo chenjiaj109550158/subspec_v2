@@ -43,7 +43,7 @@ class TargetKVSDBuilder(GeneratorPipelineBuilder):
         
         # Generator-specific configurations.
         self.generator_kwargs = {
-            "prefill_chunk_size": 2048,
+            "prefill_chunk_size": 4096,
             "Target_KV_size": 512,
             "window_size": 8,
             "SRH_path": "specdecodes/models/utils/compresskv/scores",
@@ -81,12 +81,12 @@ class TargetKVSDBuilder(GeneratorPipelineBuilder):
             else:
                 raise ValueError("max_length should be set for static cache.")
             
-            past_key_values = FlashInferCache(target_model.config, max_tokens=max_cache_len, PAGE_LEN=max_cache_len).kvCachePool
+            past_key_values = FlashInferCache(target_model.config, max_tokens=max_cache_len, PAGE_LEN=32).kvCachePool
         else:
             # Create dynamic kv-cache
             past_key_values = create_kv_cache("dynamic")
             
-        draft_past_key_values = FlashInferCache(draft_model.config, max_tokens=max_cache_len, PAGE_LEN=max_cache_len).kvCachePool
+        draft_past_key_values = FlashInferCache(draft_model.config, max_tokens=max_cache_len, PAGE_LEN=32).kvCachePool
         
         return past_key_values, draft_past_key_values
 

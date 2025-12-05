@@ -58,7 +58,7 @@ class ClassicSDBuilder(GeneratorPipelineBuilder):
         
         # Additional configurations.
         self.cache_implementation = "static"
-        self.warmup_iter = 0
+        self.warmup_iter = 3
         self.compile_mode = None
         
         # Profiling.
@@ -72,13 +72,12 @@ class ClassicSDBuilder(GeneratorPipelineBuilder):
             else:
                 raise ValueError("max_length should be set for static cache.")
             
-            past_key_values = FlashInferCache(target_model.config, max_tokens=max_cache_len, PAGE_LEN=max_cache_len).kvCachePool
+            past_key_values = FlashInferCache(target_model.config, max_tokens=max_cache_len, PAGE_LEN=32).kvCachePool
         else:
             # Create dynamic kv-cache
             past_key_values = create_kv_cache("dynamic")
             
-        draft_past_key_values = FlashInferCache(draft_model.config, max_tokens=max_cache_len, PAGE_LEN=max_cache_len).kvCachePool
-        
+        draft_past_key_values = FlashInferCache(draft_model.config, max_tokens=max_cache_len, PAGE_LEN=32).kvCachePool
         return past_key_values, draft_past_key_values
 
     def load_draft_model(self, target_model, tokenizer, draft_model_path):

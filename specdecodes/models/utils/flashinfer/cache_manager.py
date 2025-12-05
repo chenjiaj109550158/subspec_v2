@@ -463,16 +463,22 @@ class FlashInferCache():
         total_gpu_memory = torch.cuda.get_device_properties(currentDevice).total_memory
         free_memory = max(0, total_free_memory - (1 - MEMORY_FRACTION) * total_gpu_memory)   
         if free_memory < cache_page_size:
-            raise RuntimeError(
-                f"Not enough GPU memory to allocate even a single cache page "
-                f"({cache_page_size / (1024**2):.2f} MiB required, "
-                f"{free_memory / (1024**2):.2f} MiB available)."
-            )
-        num_pages_to_allocate = int(free_memory * 0.90 / cache_page_size)
+             # Try to allocate at least a few pages even if memory is tight
+             print(f"Warning: Low GPU memory. Free: {free_memory / (1024**2):.2f} MiB")
         
-        if max_tokens is not None and num_pages_to_allocate * PAGE_LEN > max_tokens:
-            num_pages_to_allocate = max_tokens // PAGE_LEN + 1
-        print(f"Reducing cache size to {num_pages_to_allocate * PAGE_LEN} tokens")
+        # Determine number of pages
+        num_pages_to_allocate = int(free_memory / cache_page_size)
+
+        # [Change] Cap the allocation if max_tokens is provided to avoid unnecessary waste
+        if max_tokens is not None:
+             max_pages_needed = math.ceil(max_tokens / PAGE_LEN)
+             if num_pages_to_allocate > max_pages_needed:
+                 num_pages_to_allocate = max_pages_needed
+                 print(f"Capping cache size to max_tokens={max_tokens} ({num_pages_to_allocate} pages)")
+
+        print(f"Allocating KV Cache: {num_pages_to_allocate} pages "
+              f"({num_pages_to_allocate * PAGE_LEN} tokens, "
+              f"{(num_pages_to_allocate * cache_page_size) / (1024**3):.2f} GiB)")
         
         self.kvCachePool = KvCachePool(
                 max_pages = num_pages_to_allocate,
