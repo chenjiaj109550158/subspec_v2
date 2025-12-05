@@ -124,14 +124,10 @@ class KvCachePool:
             self.free_page_mask[keep_pages:] = True    # mark freed pages
     def reorder_cache_with_offset(self, beam_idx: torch.LongTensor, kv_page_indices, offset=0, num_new_tokens=0):
         """
-        Reorders the cache for speculative decoding, given the selected beam indices,
-        while [:offset] remain unchanged. After reordering, sets the rest of the new tokens to zero.
-        The cache layout is assumed to be (max_pages, 2, page_len, num_heads, head_dim)
-        for each layer, and we want to preserve the same memory footprint.
-        maps logical page indices to physical page indices using kv_page_indices.
+        Reorders the cache for speculative decoding, given the selected beam indices.
+        OPTIMIZED: Performs in-place updates using Advanced Indexing to avoid .view() errors and .clone() OOM.
         """
         with nvtx.annotate("to device", color="green"):
-            # device = beam_idx.device
             beam_idx = beam_idx.to(self.device)
             # Map logical indices to physical pages
             page_mapping = torch.tensor(kv_page_indices, device=self.device, dtype=torch.long)
@@ -147,7 +143,7 @@ class KvCachePool:
         def to_flat_idx(idx: torch.Tensor):
             """
             Given a tensor of positions in [0, total_tokens),
-            map them to (page_idx, token_idx), then flatten as: page_idx * page_len + token_idx.
+            map them to (page_idx, token_idx)
             """
             logical_page_indices = idx // page_len
             token_indices = idx % page_len
@@ -159,67 +155,24 @@ class KvCachePool:
             old_page_indices, old_token_indices = to_flat_idx(old_indices)
             new_page_indices, new_token_indices = to_flat_idx(new_indices)
 
-            old_flat = old_page_indices * page_len + old_token_indices  # [beam_size]
-            new_flat = new_page_indices * page_len + new_token_indices  # [beam_size]
-
             total_tokens = offset + num_new_tokens
-            total_pages = (total_tokens + page_len - 1) // page_len  # ceiling division
-            max_flat_len = total_pages * page_len
-
-        with nvtx.annotate("stack cache", color="red"):
-            # Stack all layers into one big tensor:
-            #   self.cache_data is a list of Tensors of shape (max_pages, 2, page_len, num_heads, head_dim)
-            #   After stacking on dim=0 => shape (L, max_pages, 2, page_len, num_heads, head_dim)
-            # cache_stacked = torch.stack(self.cache_data, dim=0)
-            cache_stacked = self.cache_data
-            L, max_pages, _, page_len_, num_heads, head_dim = cache_stacked.shape
-            if page_len_ != page_len:
-                raise ValueError(
-                    f"Expected page_len={page_len}, found {page_len_} in cached data."
-                )
+            total_pages = (total_tokens + page_len - 1) // page_len
+            
+        with nvtx.annotate("validate", color="red"):
+            L, max_pages, _, page_len_, num_heads, head_dim = self.cache_data.shape
             if total_pages > max_pages:
-                raise ValueError(
-                    f"Cache does not have enough pages ({max_pages}) for total tokens ({total_tokens})."
-                )
+                 raise ValueError(f"Cache overflow: needed {total_pages} pages, but max is {max_pages}")
 
-        with nvtx.annotate("split k/v", color="green"):
-            # Separate keys and values: (L, max_pages, page_len, num_heads, head_dim)
-            k_cat = cache_stacked[:, :, 0, :, :, :].clone()
-            v_cat = cache_stacked[:, :, 1, :, :, :].clone()
-
-        with nvtx.annotate("flatten", color="blue"):
-            # Flatten the (max_pages, page_len) => single "tokens" dimension for simpler index_copy
-            k_cat = k_cat.view(L, max_pages * page_len, num_heads, head_dim)
-            v_cat = v_cat.view(L, max_pages * page_len, num_heads, head_dim)
-
-        with nvtx.annotate("reorder", color="yellow"):
-            # Reorder keys (K)
-            k_cat.index_copy_(
-                1,                 # dimension = 1
-                new_flat,          # where to copy
-                k_cat.index_select(1, old_flat)  # what to copy
-            )
-            # Reorder values (V)
-            v_cat.index_copy_(
-                1,
-                new_flat,
-                v_cat.index_select(1, old_flat)
-            )
-
-        with nvtx.annotate("unflatten", color="green"):
-        # (L, max_pages * page_len, num_heads, head_dim) => (L, max_pages, page_len, num_heads, head_dim)
-            k_cat = k_cat.view(L, max_pages, page_len, num_heads, head_dim)
-            v_cat = v_cat.view(L, max_pages, page_len, num_heads, head_dim)
-
-        with nvtx.annotate("assign", color="purple"):
-            # Place each layer's K and V back into original shape:
-            # (max_pages, 2, page_len, num_heads, head_dim)
-            # for layer_idx in range(L):
-            #     self.cache_data[layer_idx][:, 0, :, :, :].copy_(k_cat[layer_idx], non_blocking=True)
-            #     self.cache_data[layer_idx][:, 1, :, :, :].copy_(v_cat[layer_idx], non_blocking=True)
-            self.cache_data[:, :, 0, :, :, :].copy_(k_cat,non_blocking=True)
-            self.cache_data[:, :, 1, :, :, :].copy_(v_cat,non_blocking=True)
-         # zero out the rest of the cache
+        # Instead of flattening (which fails due to non-contiguous K/V), we index the dimensions directly.
+        # Pattern: cache[:, page_idx, :, token_idx, ...]
+        with nvtx.annotate("reorder_in_place", color="yellow"):
+            # 1. Read source data (This creates a small temporary copy of ONLY the moved tokens)
+            # Shape will be roughly (L, beam_size, 2, num_heads, head_dim)
+            src = self.cache_data[:, old_page_indices, :, old_token_indices, ...]
+            
+            # 2. Write to destination
+            # PyTorch handles the broadcasting and shape matching automatically
+            self.cache_data[:, new_page_indices, :, new_token_indices, ...] = src
             
 class RequestKvCache:
     def __init__(self, kvCachePool: KvCachePool, page_len: int, seq_init_len: int):
