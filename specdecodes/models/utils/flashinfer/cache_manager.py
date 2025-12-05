@@ -41,7 +41,7 @@ class KvCachePool:
         dtype: torch.dtype,
         device: torch.device,
     ):
-        max_pages = 1
+        # Removed hardcoded max_pages = 1
         
         self.cache_data =  torch.zeros(
                 num_layers, max_pages, 2, page_len, num_heads, head_dim, dtype=dtype, device=device
@@ -66,11 +66,19 @@ class KvCachePool:
         free_page_indices = self.free_page_mask.nonzero()
         assert (
             len(free_page_indices) >= num_pages
-        ), f"Out of available cache pages: asked {num_pages}, only {len(free_page_indices)} free pages"
+        ), f"Out of available cache pages: asked {num_pages}, only {len(free_page_indices)} free pages. Total pages: {self.max_pages}"
 
         allocated_indices = free_page_indices[:num_pages]
         self.free_page_mask[allocated_indices] = False
+        
         return allocated_indices.squeeze(1).tolist()
+    
+        # [Fixed] Added safety check for valid indices
+        indices_list = allocated_indices.squeeze(1).tolist()
+        if any(idx >= self.max_pages for idx in indices_list):
+            raise ValueError(f"Allocated invalid page index >= max_pages ({self.max_pages}): {indices_list}")
+            
+        return indices_list
 
     def deallocate(self, kv_page_indices: List[int]):
         self.free_page_mask[kv_page_indices] = True
@@ -114,19 +122,19 @@ class KvCachePool:
         self.free_page_mask.zero_()                    # mark all busy
         if keep_pages < self.max_pages:
             self.free_page_mask[keep_pages:] = True    # mark freed pages
-    def reorder_cache_with_offset(self, beam_idx: torch.LongTensor, offset=0, num_new_tokens=0):
+    def reorder_cache_with_offset(self, beam_idx: torch.LongTensor, kv_page_indices, offset=0, num_new_tokens=0):
         """
         Reorders the cache for speculative decoding, given the selected beam indices,
         while [:offset] remain unchanged. After reordering, sets the rest of the new tokens to zero.
         The cache layout is assumed to be (max_pages, 2, page_len, num_heads, head_dim)
         for each layer, and we want to preserve the same memory footprint.
+        maps logical page indices to physical page indices using kv_page_indices.
         """
         with nvtx.annotate("to device", color="green"):
             # device = beam_idx.device
             beam_idx = beam_idx.to(self.device)
-            # offset = offset.to(self.device)
-            # num_new_tokens = num_new_tokens.to(self.device)
-
+            # Map logical indices to physical pages
+            page_mapping = torch.tensor(kv_page_indices, device=self.device, dtype=torch.long)
             beam_size = beam_idx.size(0)
 
         # Convert old positions (beam_idx) to new positions:
@@ -141,9 +149,11 @@ class KvCachePool:
             Given a tensor of positions in [0, total_tokens),
             map them to (page_idx, token_idx), then flatten as: page_idx * page_len + token_idx.
             """
-            page_indices = idx // page_len
+            logical_page_indices = idx // page_len
             token_indices = idx % page_len
-            return page_indices, token_indices
+            # Use the physical page mapping
+            physical_page_indices = page_mapping[logical_page_indices]
+            return physical_page_indices, token_indices
 
         with nvtx.annotate("compute idx", color="blue"):
             old_page_indices, old_token_indices = to_flat_idx(old_indices)
@@ -228,11 +238,20 @@ class RequestKvCache:
 
     def increment(self, num_tokens: int = 1):
         self.kv_len += num_tokens
-        self.kv_last_page_len += num_tokens
-        if self.kv_last_page_len > self.page_len:
-            self.kv_last_page_len -= self.page_len
-            new_indices = self.kvCachePool.allocate(1)
+        
+        # Robust page allocation logic
+        target_pages = (self.kv_len + self.page_len - 1) // self.page_len if self.kv_len > 0 else 0
+        current_pages = len(self.kv_page_indices)
+        pages_to_allocate = target_pages - current_pages
+        
+        if pages_to_allocate > 0:
+            new_indices = self.kvCachePool.allocate(pages_to_allocate)
             self.kv_page_indices.extend(new_indices)
+            
+        if self.kv_len == 0:
+            self.kv_last_page_len = 0
+        else:
+            self.kv_last_page_len = (self.kv_len - 1) % self.page_len + 1
             
     def release(self):  
         self.kvCachePool.deallocate(self.kv_page_indices)
@@ -315,7 +334,8 @@ class RequestKvCache:
         if offset != 0:
             offset -=1
             
-        self.kvCachePool.reorder_cache_with_offset(beam_idx,offset,num_new_tokens)
+        # Pass self.kv_page_indices to pool
+        self.kvCachePool.reorder_cache_with_offset(beam_idx, self.kv_page_indices, offset, num_new_tokens)
        
         # update  self.kv_last_page_len self.kv_page_indices self.kv_len
         self.kv_len = offset + beam_idx.size(0) 
@@ -448,14 +468,14 @@ class FlashInferCache():
                 f"({cache_page_size / (1024**2):.2f} MiB required, "
                 f"{free_memory / (1024**2):.2f} MiB available)."
             )
-        # num_pages_to_allocate = int(free_memory * 0.50 / cache_page_size)
+        num_pages_to_allocate = int(free_memory * 0.90 / cache_page_size)
         
-        # if max_tokens is not None and num_pages_to_allocate * PAGE_LEN > max_tokens:
-        #     num_pages_to_allocate = max_tokens // PAGE_LEN + 1
-        print(f"Reducing cache size to {1 * PAGE_LEN} tokens")
+        if max_tokens is not None and num_pages_to_allocate * PAGE_LEN > max_tokens:
+            num_pages_to_allocate = max_tokens // PAGE_LEN + 1
+        print(f"Reducing cache size to {num_pages_to_allocate * PAGE_LEN} tokens")
         
         self.kvCachePool = KvCachePool(
-                max_pages = 1,
+                max_pages = num_pages_to_allocate,
                 num_layers = config.num_hidden_layers,
                 num_heads = config.num_key_value_heads,
                 head_dim = head_dim,

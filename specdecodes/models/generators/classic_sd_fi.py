@@ -360,6 +360,7 @@ class ClassicSDGeneratorBase(GeneratorBase):
             while not finished:
                 # * speculate
                 with nvtx.annotate("speculate", color="cyan"):
+                    draft_prev_kv_len = draft_request_kv_cache.get_seq_length() + 1
                     last_token_ids = input_ids[:, draft_request_kv_cache.get_seq_length():].clone(memory_format=torch.contiguous_format)
                     tree = self._speculate(last_token_ids, draft_request_kv_cache)
 
@@ -386,7 +387,7 @@ class ClassicSDGeneratorBase(GeneratorBase):
                     num_new_tokens = self.draft_params.max_verify_tokens
                     request_kv_cache.reorder_cache_with_offset(hidden_indices, offset=prev_kv_len, num_new_tokens=num_new_tokens)
                     #print(f"draft_request_kv_cache seq_len before reorder: {draft_request_kv_cache.get_seq_length()}")
-                    draft_request_kv_cache.reorder_cache_with_offset(hidden_indices, offset=draft_request_kv_cache.get_seq_length(), num_new_tokens=num_new_tokens)
+                    draft_request_kv_cache.reorder_cache_with_offset(hidden_indices, offset=draft_prev_kv_len, num_new_tokens=num_new_tokens)
                     #print(f"draft_request_kv_cache seq_len after reorder: {draft_request_kv_cache.get_seq_length()}")
                     #input("Press Enter to continue...")
 
