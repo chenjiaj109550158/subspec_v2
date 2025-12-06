@@ -83,45 +83,39 @@ class KvCachePool:
     def deallocate(self, kv_page_indices: List[int]):
         self.free_page_mask[kv_page_indices] = True
  
-    def crop(self, seq_len: int) -> None:
+    def crop(self, seq_len: int, page_indices: List[int]) -> None:
         """
-        Zero‑out all KV cache entries after `seq_len` tokens and mark fully
-        unused pages as free.
-
-        Args
-        ----
-        seq_len : int
-            Number of *valid* tokens to keep (counting from the beginning of
-            the sequence).  Must satisfy 0 ≤ seq_len ≤ max_pages × page_len.
-
-        Notes
-        -----
-        * Shape of `self.cache_data`:
-          (num_layers, max_pages, 2, page_len, num_heads, head_dim)
-        * Operation is O(1) – pure tensor slicing, no Python loops.
+        Zero-out the data in the specific page that contains the new boundary.
+        FIX: Correctly identifies the page corresponding to seq_len, not just the last allocated page.
         """
-        if not (0 <= seq_len <= self.max_pages * self.page_len):
-            raise ValueError(
-                f"seq_len={seq_len} is outside the [0, {self.max_pages * self.page_len}] range."
-            )
+        if len(page_indices) == 0:
+            return
+        
+        if seq_len == 0:
+            # If length is 0, we can theoretically zero everything, but usually deallocate handles it.
+            # To be safe, we zero the first page's start.
+            self.cache_data[:, page_indices[0], ...].zero_()
+            return
 
-        # ── ❶  Locate the split point ─────────────────────────────────────
-        full_pages = seq_len // self.page_len          # fully‑kept pages
-        remainder  = seq_len %  self.page_len          # tokens in last page
-        keep_pages = full_pages + (1 if remainder else 0)
+        # 1. Identify which logical page the new end falls into
+        # (seq_len - 1) is the index of the last valid token.
+        logical_page_idx = (seq_len - 1) // self.page_len
+        
+        # Safety check
+        if logical_page_idx >= len(page_indices):
+            return 
 
-        # ── ❷  Zero out everything **after** seq_len ───────────────────────
-        if remainder:  # partial last page: zero tokens [remainder : page_len)
-            self.cache_data[:, full_pages, :, remainder:, ...].zero_()
+        # 2. Get the physical page index
+        physical_page_idx = page_indices[logical_page_idx]
+        
+        # 3. Calculate offset in that page
+        # valid_tokens_in_last_page is how many tokens we KEEP in this boundary page.
+        valid_tokens_in_last_page = (seq_len - 1) % self.page_len + 1
+        
+        # 4. Zero out the rest of this page (from valid_tokens onwards)
+        if valid_tokens_in_last_page < self.page_len:
+            self.cache_data[:, physical_page_idx, :, valid_tokens_in_last_page:, ...].zero_()
 
-        if keep_pages < self.max_pages:                # zero whole pages
-            self.cache_data[:, keep_pages:, ...].zero_()
-
-        # ── ❸  Update the free‑page map so allocators can reuse them ───────
-        # pages [0 : keep_pages) are still occupied, the rest become free
-        self.free_page_mask.zero_()                    # mark all busy
-        if keep_pages < self.max_pages:
-            self.free_page_mask[keep_pages:] = True    # mark freed pages
     def reorder_cache_with_offset(self, beam_idx: torch.LongTensor, kv_page_indices, offset=0, num_new_tokens=0):
         """
         Reorders the cache for speculative decoding, given the selected beam indices.
@@ -243,41 +237,35 @@ class RequestKvCache:
             self.kv_last_page_len = (self.kv_len - 1) % self.page_len + 1
 
     def crop(self, start: int, end = None, dim=0):
-        """Crop the past key/values up to a new `max_length` (negative removes from the end)."""
+        """Crop the past key/values up to a new `max_length`."""
         if end is None:
             end = self.get_seq_length()
-            
         if start < 0:
             start = end - abs(start)
-        if end <= start:
-            return
-
-        self.kv_len = start
-        # self.kvCachePool.crop(start)
-
-        if self.kv_len == 0:
-            self.kv_last_page_len = 0
-        else:
-            self.kv_last_page_len = (self.kv_len - 1) % self.page_len + 1
-
-        num_pages_needed = (self.kv_len + self.page_len - 1) // self.page_len  # Ceiling division
-        # Deallocate any extra pages that are no longer needed
-        current_num_pages = len(self.kv_page_indices)
-        if current_num_pages > num_pages_needed:
-            # Identify extra pages to deallocate
-            extra_pages = self.kv_page_indices[num_pages_needed:]
-            # Deallocate the extra pages
-            self.kvCachePool.deallocate(extra_pages)
-            # Update kv_page_indices to keep only the needed pages
-            self.kv_page_indices = self.kv_page_indices[:num_pages_needed]
+        
+        if start < self.kv_len:
+            self.kv_len = start
             
-        elif current_num_pages < num_pages_needed:
-            # Should not happen in speculative decoding, but handle just in case
-            # Allocate additional pages
-            additional_pages_needed = num_pages_needed - current_num_pages
-            new_indices = self.kvCachePool.allocate(additional_pages_needed)
-            self.kv_page_indices.extend(new_indices)
-            raise ValueError("need to allocate new pages in reorder cache, should not happen")
+            self.kvCachePool.crop(self.kv_len, self.kv_page_indices)
+
+            if self.kv_len == 0:
+                self.kv_last_page_len = 0
+            else:
+                self.kv_last_page_len = (self.kv_len - 1) % self.page_len + 1
+
+            num_pages_needed = (self.kv_len + self.page_len - 1) // self.page_len
+            current_num_pages = len(self.kv_page_indices)
+            
+            if current_num_pages > num_pages_needed:
+                extra_pages = self.kv_page_indices[num_pages_needed:]
+                self.kvCachePool.deallocate(extra_pages)
+                self.kv_page_indices = self.kv_page_indices[:num_pages_needed]
+            
+            elif current_num_pages < num_pages_needed:
+                # This path usually shouldn't happen in crop(shrink), but safe to keep
+                additional_pages_needed = num_pages_needed - current_num_pages
+                new_indices = self.kvCachePool.allocate(additional_pages_needed)
+                self.kv_page_indices.extend(new_indices)
        
     def reorder_cache_with_offset(self, beam_idx: torch.LongTensor, offset=0, num_new_tokens=0):
         """
