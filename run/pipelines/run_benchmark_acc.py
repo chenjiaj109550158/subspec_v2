@@ -10,7 +10,7 @@ import gc
 from tqdm import tqdm
 import numpy as np
 
-from .benchmarks.utils.eval_acc import run_gsm8k_eval, run_aime_eval, run_livecodebench_eval, run_mmlu_pro_eval, run_longbench_eval
+from .benchmarks.utils.eval_acc import run_gsm8k_eval, run_aime_eval, run_livecodebench_eval, run_mmlu_pro_eval, run_longbench_eval, run_longbenchv2_eval
 from .benchmarks.gsm8k import load_gsm8k_dataset_answer
 from .benchmarks.aime import load_aime_dataset_answer
 from .benchmarks.livecodebench import load_livecodebench_dataset_answer
@@ -31,6 +31,7 @@ from .benchmarks.passage_count import load_passage_count_dataset_answer
 from .benchmarks.passage_retrieval_en import load_passage_retrieval_en_dataset_answer
 from .benchmarks.lcc import load_lcc_dataset_answer
 from .benchmarks.repobench_p import load_repobench_p_dataset_answer
+from .benchmarks.longbench_v2 import load_longbench_v2_dataset_answer
 
 DATASET_LOADER = {
     "gsm8k":      load_gsm8k_dataset_answer,
@@ -53,6 +54,7 @@ DATASET_LOADER = {
     "passage_retrieval_en": load_passage_retrieval_en_dataset_answer,
     "lcc": load_lcc_dataset_answer,
     "repobench_p": load_repobench_p_dataset_answer,
+    "longbench_v2": load_longbench_v2_dataset_answer,
 }
 
 BENCHMARK_EVALUATORS = {
@@ -76,6 +78,7 @@ BENCHMARK_EVALUATORS = {
     "passage_retrieval_en": run_longbench_eval,  
     "lcc": run_longbench_eval,  
     "repobench_p": run_longbench_eval,
+    "longbench_v2": run_longbenchv2_eval,
 }
 
 def main(builder, benchmarks=None, max_samples=None):
@@ -95,7 +98,7 @@ def main(builder, benchmarks=None, max_samples=None):
     # Build bench_list and check if all names are valid
     bench_list = benchmarks.split(",") if benchmarks is not None else []
     for b in bench_list:
-        if b not in DATASET_LOADER:
+        if b not in DATASET_LOADER and not b.startswith("longbench_v2") and "longgenbench" not in b:
             raise ValueError(f"Unknown benchmark: {b}. Available benchmarks: {list(DATASET_LOADER.keys())}")
     print(f"Benchmarks to run: {bench_list}")
     
@@ -105,6 +108,14 @@ def main(builder, benchmarks=None, max_samples=None):
         print(f"Deleted old {args.out_dir}")
         os.makedirs(args.out_dir, exist_ok=True)
         
+    try:
+        model2maxlen = json.load(open("./run/pipelines/benchmarks/utils/config/model2maxlen.json", "r"))
+        max_length = model2maxlen.get(tokenizer.name_or_path, 32768) # Default if not found, though logic implies it should be there
+        print("Max length for model {}: {}".format(tokenizer.name_or_path, max_length))
+    except FileNotFoundError:
+        print("Warning: model2maxlen.json not found. Defaulting max_length to None or handling inside evaluator might differ.")
+        max_length = None
+    
     # Run benchmarks
     log_dir_base = os.path.join(args.log_dir, time.strftime("%Y%m%d-%H%M%S"))
     for bench_name in tqdm(bench_list, desc="Running benchmarks"):
@@ -128,6 +139,21 @@ def main(builder, benchmarks=None, max_samples=None):
     
             random.shuffle(dataset)
             dataset = dataset[:num_samples]
+        elif "longbench_v2" in bench_name: 
+            # longbench_v2 dataset is loaded differently
+            bench_name_full = bench_name
+            
+            if bench_name.startswith("longbench_v2_"):
+                suffix = bench_name[len("longbench_v2_"):]
+                bench_name_full = f"longbench_v2-{suffix.replace('_', '-')}"
+                print(f"Normalized benchmark name from '{bench_name}' to '{bench_name_full}' for eval_acc compatibility.")
+
+            dataset = DATASET_LOADER["longbench_v2"]()
+            print(f"Running benchmark: {bench_name}, normalized: {bench_name_full}, samples: {len(dataset)}")
+            bench_name = "longbench_v2"
+            
+            num_samples = min(len(dataset), max_samples) if max_samples is not None else len(dataset)
+            dataset = dataset[:num_samples]
         elif not bench_name == "mmlu_pro":
             dataset = DATASET_LOADER[bench_name]()
             num_samples = min(len(dataset), max_samples) if max_samples is not None else len(dataset)
@@ -147,6 +173,8 @@ def main(builder, benchmarks=None, max_samples=None):
         # Evaluate
         if BENCHMARK_EVALUATORS[bench_name] == run_longbench_eval:
             metrics_json = BENCHMARK_EVALUATORS[bench_name](generator, tokenizer, past_kv, draft_past_kv, args, dataset, log_dir, bench_name)
+        elif BENCHMARK_EVALUATORS[bench_name] == run_longbenchv2_eval: 
+            metrics_json = BENCHMARK_EVALUATORS[bench_name](generator, tokenizer, past_kv, draft_past_kv, args, dataset, log_dir, bench_name_full, max_length)
         else:
             metrics_json = BENCHMARK_EVALUATORS[bench_name](generator, tokenizer, past_kv, draft_past_kv, args, dataset, log_dir)
         
@@ -176,6 +204,28 @@ def main(builder, benchmarks=None, max_samples=None):
         #     }, f, indent=4)
         #     f.write("\n")
 
+        if isinstance(metrics_json, (tuple, list)):
+            keys = [
+                "tput", "tput_std", 
+                "decoding_tput", "decoding_tput_std",
+                "tacc", "tacc_std", 
+                "accuracy", 
+                "avg_draft_time", "avg_target_time", 
+                "avg_target_prefill_time", "avg_target_decoding_time", 
+                "peak_memory"
+            ]
+            metrics_dict = {}
+            for i, val in enumerate(metrics_json):
+                if i < len(keys):
+                    metrics_dict[keys[i]] = val
+                else:
+                    # Fallback for extra values
+                    metrics_dict[f"metric_{i}"] = val
+            
+            # Explicitly add tacc_judge if not already present
+            metrics_dict["Tacc_judge"] = tacc_judge_value
+            metrics_json = metrics_dict
+            
         # reduce float values to 3 decimal places
         for key in metrics_json:
             if isinstance(metrics_json[key], float):

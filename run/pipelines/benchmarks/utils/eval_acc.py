@@ -7,7 +7,14 @@ import gc
 from tqdm import tqdm
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
+template_rag = open('run/pipelines/benchmarks/utils/config/0shot_rag.txt', encoding='utf-8').read()
+template_no_context = open('run/pipelines/benchmarks/utils/config/0shot_no_context.txt', encoding='utf-8').read()
+template_0shot = open('run/pipelines/benchmarks/utils/config/0shot.txt', encoding='utf-8').read()
+template_0shot_cot = open('run/pipelines/benchmarks/utils/config/0shot_cot.txt', encoding='utf-8').read()
+template_0shot_cot_ans = open('run/pipelines/benchmarks/utils/config/0shot_cot_ans.txt', encoding='utf-8').read()
+
 from .utils import (
+    build_chat,
     qa_f1_score,
     rouge_zh_score,
     qa_f1_zh_score,
@@ -17,6 +24,9 @@ from .utils import (
     retrieval_zh_score,
     count_score,
     code_sim_score,
+    score_longgenbench_single,
+    build_input_ids,
+    extract_longbenchv2_answer,
 )
 
 dataset2metric = {
@@ -950,3 +960,374 @@ def run_longbench_eval(generator, tokenizer, past_key_values, draft_past_key_val
         "avg_target_time": float(avg_target_time),
         "peak_memory_gib": float(peak_memory),
     }
+
+
+def run_longbenchv2_eval(
+    generator,
+    tokenizer,
+    past_key_values,
+    draft_past_key_values,
+    args,
+    dataset,
+    log_dir,
+    bench_name,
+    max_len,
+):
+    """
+    LongBench-v2 multiple-choice evaluation with filtering options.
+
+    Args:
+        generator: The text generation model.
+        tokenizer: The tokenizer for encoding and decoding text.
+        past_key_values: Cached key-value pairs for the model.
+        draft_past_key_values: Cached key-value pairs for the draft model.
+        args: Additional arguments for evaluation.
+        dataset: The dataset to evaluate on.
+        log_dir: Directory to save logs.
+        bench_name: Name of the benchmark.
+        max_len: Maximum length for input sequences.
+
+    Returns:
+        A tuple of metrics:
+        (tput_mean, tput_std, tacc_mean, tacc_std,
+         answer_accuracy, avg_draft_time, avg_target_time, peak_memory)
+
+    """
+
+    # 0. load bench_name, length_filter, diff_filter
+    split_bench_name = bench_name.split("-")
+    if len(split_bench_name) == 3:
+        bench_name, length_filter, diff_filter = split_bench_name
+    else:
+        length_filter, diff_filter = "overall", "overall"
+
+    def _keep(item):
+        ok = True
+        if length_filter != "overall":
+            ok = ok and str(item.get("length", "")).lower() == length_filter
+        if diff_filter != "overall":
+            ok = ok and str(item.get("difficulty", "")).lower() == diff_filter
+        return ok
+
+    filtered_dataset = [it for it in dataset if _keep(it)]
+    print(
+        f"LongBench-v2 filter: length={length_filter}, difficulty={diff_filter}, "
+        f"{len(filtered_dataset)}/{len(dataset)} samples kept"
+    )
+    if len(filtered_dataset) == 0:
+        print("WARNING: no samples after filtering, return zeros.")
+        return 0, 0, 0, 0, 0.0, 0.0, 0.0, 0.0
+
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, "0.jsonl")
+
+    # 1. Warm-up (identical to original implementation)
+    original_profiling = generator.profiling
+    generator.profiling = False
+    for _ in tqdm(range(getattr(args, "warmup_iter", 0)), desc="Warmup LongBench-v2"):
+        warmup_prompt = (
+            "You are given a long document and a multiple-choice question.\n"
+            "Read the document carefully and answer with only the letter of the correct option.\n\n"
+            "DOCUMENT:\n"
+            + ("This is a dummy document. " * 32)
+            + "\n\nQUESTION:\nWhat is 1 + 1?\n\n"
+            "OPTIONS:\nA. 0\nB. 1\nC. 2\nD. 3\n\nAnswer:"
+        )
+        #tokenizer.use_default_system_prompt = True
+        warmup_tokenized, _ = build_input_ids(
+            prompt=warmup_prompt,
+            tokenizer=tokenizer,
+            device=generator.device,
+            max_len=max_len,
+            args=args,
+        )
+        if warmup_tokenized is None:
+            continue
+        warmup_ids = warmup_tokenized.unsqueeze(0).to(generator.device)
+
+        generator.generate(
+            warmup_ids,
+            temperature=args.temperature,
+            max_new_tokens=128,
+            do_sample=args.do_sample,
+            past_key_values=past_key_values,
+            draft_past_key_values=draft_past_key_values,
+        )
+
+        past_key_values.reset()
+        if draft_past_key_values is not None:
+            draft_past_key_values.reset()
+    generator.profiling = original_profiling
+
+    # 2. Main evaluation loop
+    tput_list = []
+    decoding_tput_list = []
+    tacc_list = []  # average token acceptance rate per sample
+    draft_times = []
+    target_times = []
+    target_prefill_times = []
+    target_decoding_times = []
+    total_q, correct_q = 0, 0
+
+    use_cot = getattr(args, "cot", False)
+    use_no_context = getattr(args, "no_context", False)
+    rag_topk = getattr(args, "rag", 0)
+
+    if args.generator_kwargs['limit_output_length'] is not None:
+        max_new_tokens = args.generator_kwargs['limit_output_length']
+    else:
+        max_new_tokens = 128
+
+    for idx, item in tqdm(
+        enumerate(filtered_dataset),
+        total=len(filtered_dataset),
+        desc="Evaluating LongBench-v2",
+    ):
+        context = item["context"]
+
+        # 2.1 select template 
+        if rag_topk > 0 and "retrieved_context" in item:
+            template = template_rag
+            retrieved = item["retrieved_context"][:rag_topk]
+            retrieved = sorted(retrieved, key=lambda x: x["c_idx"])
+            context_used = "\n\n".join(
+                [f"Retrieved chunk {i+1}: {x['content']}" for i, x in enumerate(retrieved)]
+            )
+        elif use_no_context:
+            template = template_no_context
+            context_used = ""
+        elif use_cot:
+            template = template_0shot_cot
+            context_used = context
+            max_new_tokens = 1024
+        else:
+            template = template_0shot
+            context_used = context
+
+        # 2.2 build prompt 
+        prompt = (
+            template.replace("$DOC$", context_used.strip())
+            .replace("$Q$", item["question"].strip())
+            .replace("$C_A$", item["choice_A"].strip())
+            .replace("$C_B$", item["choice_B"].strip())
+            .replace("$C_C$", item["choice_C"].strip())
+            .replace("$C_D$", item["choice_D"].strip())
+        )
+
+        #tokenizer.use_default_system_prompt = True
+        tokenized_prompt, actual_len = build_input_ids(
+            prompt=prompt,
+            tokenizer=tokenizer,
+            device=generator.device,
+            max_len=max_len,
+            args=args,
+        )
+
+        if tokenized_prompt is None:
+            print("Skip sample due to length constraint.")
+            continue
+
+        input_ids = tokenized_prompt.unsqueeze(0).to(generator.device)
+
+        # 2.3 generate 
+        if use_cot:
+            # first time: ask for COT
+            output_ids = generator.generate(
+                input_ids,
+                temperature=args.temperature,
+                max_new_tokens=max_new_tokens,
+                do_sample=args.do_sample,
+                past_key_values=past_key_values,
+                draft_past_key_values=draft_past_key_values,
+            )
+            past_key_values.reset()
+            if draft_past_key_values is not None:
+                draft_past_key_values.reset()
+
+            response_cot = tokenizer.decode(
+                output_ids[0][input_ids.shape[1]:], skip_special_tokens=True
+            ).strip()
+            
+            record = {**getattr(generator, "exp_log", {})}
+            if record.get("tput") is not None:
+                tput_list.append(record["tput"])
+            if record.get("decoding_tput") is not None:
+                decoding_tput_list.append(record["decoding_tput"])
+            if record.get("avg_sampled") is not None:
+                tacc_list.append(record["avg_sampled"])
+            if record.get("avg_draft_time") is not None:
+                draft_times.append(record["avg_draft_time"])
+            if record.get("avg_target_time") is not None:
+                target_times.append(record["avg_target_time"])
+            if record.get("avg_target_prefill_time") is not None:
+                target_prefill_times.append(record["avg_target_prefill_time"])
+            if record.get("avg_target_decoding_time") is not None:  
+                target_decoding_times.append(record["avg_target_decoding_time"])
+
+            # second time: ask for answer only
+            prompt2 = (
+                template_0shot_cot_ans.replace("$DOC$", context_used.strip())
+                .replace("$Q$", item["question"].strip())
+                .replace("$C_A$", item["choice_A"].strip())
+                .replace("$C_B$", item["choice_B"].strip())
+                .replace("$C_C$", item["choice_C"].strip())
+                .replace("$C_D$", item["choice_D"].strip())
+                .replace("$COT$", response_cot)
+            )
+            max_new_tokens = 128
+
+            tokenized_prompt2, actual_len2 = build_input_ids(
+                prompt=prompt2,
+                tokenizer=tokenizer,
+                device=generator.device,
+                max_len=max_len,
+                args=args,
+            )
+            if tokenized_prompt2 is None:
+                print(f"COT answer prompt too long ({actual_len2}). Skip it!")
+                continue
+
+            input_ids2 = tokenized_prompt2.unsqueeze(0).to(generator.device)
+
+            output_ids = generator.generate(
+                input_ids2,
+                temperature=args.temperature,
+                max_new_tokens=max_new_tokens,
+                do_sample=args.do_sample,
+                past_key_values=past_key_values,
+                draft_past_key_values=draft_past_key_values,
+            )
+
+            past_key_values.reset()
+            if draft_past_key_values is not None:
+                draft_past_key_values.reset()
+
+            response = tokenizer.decode(
+                output_ids[0][input_ids2.shape[1]:], skip_special_tokens=True
+            ).strip()
+        else:
+            # non-COT: single generation
+            output_ids = generator.generate(
+                input_ids,
+                temperature=args.temperature,
+                max_new_tokens=max_new_tokens,
+                do_sample=args.do_sample,
+                past_key_values=past_key_values,
+                draft_past_key_values=draft_past_key_values,
+            )
+
+            past_key_values.reset()
+            if draft_past_key_values is not None:
+                draft_past_key_values.reset()
+
+            response = tokenizer.decode(
+                output_ids[0][input_ids.shape[1]:], skip_special_tokens=True
+            ).strip()
+            response_cot = None
+            
+            record = {**getattr(generator, "exp_log", {})}
+            if record.get("tput") is not None:
+                tput_list.append(record["tput"])
+            if record.get("decoding_tput") is not None:
+                decoding_tput_list.append(record["decoding_tput"])
+            if record.get("avg_sampled") is not None:
+                tacc_list.append(record["avg_sampled"])
+            if record.get("avg_draft_time") is not None:
+                draft_times.append(record["avg_draft_time"])
+            if record.get("avg_target_time") is not None:
+                target_times.append(record["avg_target_time"])
+            if record.get("avg_target_prefill_time") is not None:
+                target_prefill_times.append(record["avg_target_prefill_time"])
+            if record.get("avg_target_decoding_time") is not None:  
+                target_decoding_times.append(record["avg_target_decoding_time"])
+
+        # 2.4 extract answer & score
+        pred = extract_longbenchv2_answer(response)
+        gt = item["answer"].strip()
+        judge = (pred == gt)
+
+        total_q += 1
+        if judge:
+            correct_q += 1
+
+        # 2.5 build record
+        record.update(
+            {
+                "_id": item.get("_id"),
+                "domain": item.get("domain"),
+                "sub_domain": item.get("sub_domain"),
+                "difficulty": item.get("difficulty"),
+                "length": item.get("length"),
+                "actual_length": actual_len,
+                "query": item["question"],
+                "response": response,
+                "response_cot": response_cot,
+                "answer": gt,
+                "pred": pred,
+                "judge": judge,
+                "Accuracy": int(judge),
+                "context": context_used[:1000],
+                "peak_memory": float(
+                    torch.cuda.max_memory_reserved(generator.device) / (1024 ** 3)
+                ),
+            }
+        )
+
+        with open(log_file, "a+", encoding="utf-8") as f:
+            json.dump(record, f, ensure_ascii=False)
+            f.write("\n")
+
+        del input_ids, output_ids
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    # 3. Aggregate overall metrics
+    tput_mean, tput_std = (
+        (np.mean(tput_list), np.std(tput_list)) if tput_list else (0.0, 0.0)
+    )
+    decoding_tput_mean, decoding_tput_std = (
+        (np.mean(decoding_tput_list), np.std(decoding_tput_list)) if decoding_tput_list else (0.0, 0.0)
+    )
+    tacc_mean, tacc_std = (
+        (np.mean(tacc_list), np.std(tacc_list)) if tacc_list else (0.0, 0.0)
+    )
+    answer_accuracy = round(100.0 * correct_q / total_q, 2) if total_q > 0 else 0.0
+    avg_draft = float(np.mean(draft_times)) if draft_times else 0.0
+    avg_target = float(np.mean(target_times)) if target_times else 0.0
+    avg_target_prefill = float(np.mean(target_prefill_times)) if target_prefill_times else 0.0
+    avg_target_decoding = float(np.mean(target_decoding_times)) if target_decoding_times else 0.0
+    peak_memory = float(
+        torch.cuda.max_memory_reserved(generator.device) / (1024 ** 3)
+    )
+
+    # 4. Print summary
+    print(f"Final {bench_name} Results:")
+    print(f"\tThroughput       : {tput_mean:.3f} ± {tput_std:.3f} tokens/sec")
+    print(f"\tDecoding Throughput : {decoding_tput_mean:.3f} ± {decoding_tput_std:.3f} tokens/sec")
+    print(f"\tToken Acceptance : {tacc_mean:.3f} ± {tacc_std:.3f}")
+    print(f"\tAnswer Accuracy  : {answer_accuracy:.3f} ({correct_q}/{total_q})")
+    print(f"\tAvg Draft Time   : {avg_draft:.3f} sec")
+    print(f"\tAvg Target Time  : {avg_target:.3f} sec")
+    print(f"\tAvg Target Prefill Time  : {avg_target_prefill:.3f} sec")
+    print(f"\tAvg Target Decoding Time : {avg_target_decoding:.3f} sec")
+    print(f"\tPeak Memory      : {peak_memory:.3f} GiB")
+    if hasattr(generator, "judge_acc_len_list"):
+        print(f"\tTacc_judge       : {np.mean(generator.judge_acc_len_list):.3f}")
+    else:
+        print("\tTacc_judge       : 0.000 (not available)")
+
+    # 5. Return metrics tuple
+    return (
+        tput_mean,
+        tput_std,
+        decoding_tput_mean,
+        decoding_tput_std,
+        tacc_mean,
+        tacc_std,
+        answer_accuracy,
+        avg_draft,
+        avg_target,
+        avg_target_prefill,
+        avg_target_decoding,
+        peak_memory
+    )

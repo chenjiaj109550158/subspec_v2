@@ -10,6 +10,12 @@ from rouge import Rouge
 from typing import List, Tuple, Dict, Optional, Any
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
+# for Longbench
+def build_chat(prompt):
+    prompt = f"<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n{prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+
+    return prompt
+
 def normalize_answer(s):
     """Lower text and remove punctuation, articles and extra whitespace."""
 
@@ -144,6 +150,73 @@ def qa_f1_zh_score(prediction, ground_truth, **kwargs):
     ground_truth_tokens = [token for token in ground_truth_tokens if len(token) > 0]
     return f1_score(prediction_tokens, ground_truth_tokens)
 
+# for Longbench v2
+def build_input_ids(
+    prompt: str,
+    tokenizer,
+    device,
+    max_len: int,
+    args,
+):
+    use_chat_template = getattr(args, "use_chat_template", True) and hasattr(tokenizer, "apply_chat_template")
+
+    if use_chat_template:
+        messages = [{"role": "user", "content": prompt}]
+        text = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+    else:
+        text = prompt
+
+    effective_max_len = max_len
+    if hasattr(args, "max_length") and args.max_length is not None:
+        effective_max_len = min(effective_max_len, args.max_length)
+
+    encoded = tokenizer(
+        text,
+        truncation=False,
+        return_tensors="pt",
+    )
+    tokenized_prompt = encoded.input_ids[0]  # shape: [seq_len]
+
+    seq_len = tokenized_prompt.shape[0]
+    if seq_len > effective_max_len:
+        half = effective_max_len // 2
+        remain = effective_max_len - half  
+        head = tokenized_prompt[:half]
+        tail = tokenized_prompt[-remain:]
+        tokenized_prompt = torch.cat([head, tail], dim=0)
+        seq_len = tokenized_prompt.shape[0]
+
+    min_length = getattr(args, "min_length", 0)
+    if seq_len < min_length:
+        return None, None
+
+    return tokenized_prompt, seq_len
+
+def extract_longbenchv2_answer(response: str):
+    response = response.replace('*', '')
+    match = re.search(r'The correct answer is \(([A-D])\)', response)
+    if match:
+        return match.group(1)
+    else:
+        match = re.search(r'The correct answer is ([A-D])', response)
+        if match:
+            return match.group(1)
+        else:
+            # search for first single character A-D in front of "The correct answer is"
+            match = re.search(r'The correct answer is.*?\b([A-D])\b', response)
+            if match:
+                return match.group(1)
+            else:
+                # search for first single character A-D in the response
+                match = re.search(r'\b([A-D])\b', response)
+                if match:
+                    return match.group(1)
+                else:
+                    return None 
 
 # for Longgenbench
 class LLMJudge:
