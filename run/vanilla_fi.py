@@ -34,13 +34,14 @@ class NaiveBuilder(GeneratorPipelineBuilder):
         self.llm_path = "meta-llama/Llama-3.1-8B-Instruct"
         
         # Generation parameters.
-        self.max_length = 16 * 1024
+        self.max_length = 128 * 1024
         self.do_sample = False
         self.temperature = 0
         
         # Generator-specific configurations.
         self.generator_kwargs = {
             "prefill_chunk_size": 4096,
+            "limit_output_length": 8192, # limit output length at least 8192 tokens, None: no limit by default
         }
         
         # Recipe for quantization and offloading.

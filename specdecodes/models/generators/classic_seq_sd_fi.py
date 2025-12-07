@@ -19,6 +19,7 @@ class ClassicSeqFiGeneratorBase(GeneratorBase):
         super().__init__(*model_args, **kwargs)
         self.generator_kwargs = generator_kwargs or {}
         self.prefill_chunk_size = self.generator_kwargs.get("prefill_chunk_size", None)
+        self.limit_output_length = generator_kwargs.get("limit_output_length", None)
 
     def init_cuda_graph_runner(self, device, kvCachePool=None):
         """

@@ -22,7 +22,7 @@ class GeneratorBase(nn.Module):
             self.draft_model = None
 
         self.cache_implementation = cache_implementation
-        
+        self.limit_output_length = generator_kwargs.get("limit_output_length", None)
         # Set prefill function same as forward so torch.compile() forward will not execute on prefill phase)
         self.target_model.prefill_forward = self.target_model.forward
 
@@ -54,7 +54,7 @@ class GeneratorBase(nn.Module):
         warpers = LogitsProcessorList()
         
         if temperature is not None and temperature != 1.0:
-            warpers.append(TemperatureLogitsWarper(temperature))
+            warpers.append(TemperatureLogitsWarper(temperature)) 
         if top_k is not None and top_k != 0:
             warpers.append(TopKLogitsWarper(top_k=top_k))
         if top_p is not None and top_p < 1.0:
@@ -98,7 +98,10 @@ class GeneratorBase(nn.Module):
                     "stop strings, you must pass the model's tokenizer to the `tokenizer` argument of `generate`."
                 )
             criteria.append(StopStringCriteria(stop_strings=stop_strings, tokenizer=self.tokenizer))
-        if eos_token_tensor is not None:
+
+        limit_output_mode = (self.limit_output_length is not None and self.limit_output_length >= max_new_tokens)
+        
+        if eos_token_tensor is not None and not limit_output_mode:
             # EosTokenCriteria only checks last input token,
             # make sure not token is appended after eos_token_tensor during generation
             criteria.append(EosTokenCriteria(eos_token_id=eos_token_tensor))
