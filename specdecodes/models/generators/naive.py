@@ -12,7 +12,7 @@ class NaiveGeneratorBase(GeneratorBase):
     def __init__(self, generator_kwargs, *model_args, **kwargs):
         super().__init__(*model_args, **kwargs)
         self.prefill_chunk_size = generator_kwargs.get("prefill_chunk_size", None)
-        print(f"prefill_chunk_size: {self.prefill_chunk_size}")
+        self.limit_output_length = generator_kwargs.get("limit_output_length", None)
 
     def _generate(
         self,
