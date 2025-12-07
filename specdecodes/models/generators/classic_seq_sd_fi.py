@@ -224,8 +224,16 @@ class ClassicSeqFiGeneratorBase(GeneratorBase):
                     self.kvCachePool.cache_data[0].dtype,
                 )
                 
+                chunk_pos_ids = torch.arange(
+                    current_kv_len, 
+                    current_kv_len + num_new_tokens, 
+                    dtype=torch.long, 
+                    device=input_ids.device
+                ).unsqueeze(0)
+
                 self.target_model.prefill_forward(
                     input_ids=chunk,
+                    position_ids=chunk_pos_ids, 
                     past_key_values=None,
                     use_cache=False,
                     kvCachePool=self.kvCachePool,
@@ -233,6 +241,8 @@ class ClassicSeqFiGeneratorBase(GeneratorBase):
                     mode='prefill', 
                     flashinferWrapper=self.flashinferWrapper,
                 )
+                
+                current_kv_len += num_new_tokens
 
         cache_position = torch.tensor([input_ids.shape[1]], device=input_ids.device)
 
