@@ -12,11 +12,16 @@ from ..utils.flashinfer.cache_manager import (
     FlashInferCache
 )
 from ..utils.flashinfer.attention_wrapper import FlashinferAttentionWrapper
-from ..utils.monkey_patch import CaptureAttentionContext
+from ..utils.compresskv.monkey_patch import CaptureAttentionContext
 
 class TargetkvSeqFiDraftModel(DraftModelBase):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # Initialize placeholders for captured data
+        self.latest_captured_queries = None
+        self.latest_captured_rope_queries = None
+        self.important_layers = None
+        self.important_heads = None
     
     def forward(self, input_ids, with_softmax=False, *model_args, **kwargs):
         logits = self.model(input_ids, *model_args, **kwargs).logits
@@ -297,53 +302,55 @@ class TargetkvSeqFiDraftModel(DraftModelBase):
         next_token = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
         draft_ids.append(next_token)
 
-        # 4) Autoregressive Loop
-        for i in range(self.draft_params.max_depth - 1):
-            with nvtx.annotate("draft step", color="green"):
-                request_kv_cache.increment(1)
-                
-                current_input = draft_ids[-1]
-                if current_input.dim() > 2:
-                    current_input = current_input.view(batch_size, 1)
+        # 4) Autoregressive Loop - INSIDE context manager
+        # WRAPPER: Use the Context Manager here to activate the monkey patch
+        with CaptureAttentionContext(self):
+            for i in range(self.draft_params.max_depth - 1):
+                with nvtx.annotate("draft step", color="green"):
+                    request_kv_cache.increment(1)
+                    
+                    current_input = draft_ids[-1]
+                    if current_input.dim() > 2:
+                        current_input = current_input.view(batch_size, 1)
 
-                current_pos_ids = torch.tensor([[kv_len]], device=device, dtype=torch.long)
-                
-                # Get new batch position data
-                batch_position = getKvCacheBatchPosition(
-                    request_kv_caches=[request_kv_cache],
-                    mode='decode', 
-                    device=device,
-                    treeTokens=1,
-                )
-                
-                # If graph captured, use decode_step
-                if hasattr(self, "graph"):
-                    logits = self.decode_step(
-                        current_input,
-                        current_pos_ids,
-                        batch_position,
-                        self.kvCachePool
+                    current_pos_ids = torch.tensor([[kv_len]], device=device, dtype=torch.long)
+                    
+                    # Get new batch position data
+                    batch_position = getKvCacheBatchPosition(
+                        request_kv_caches=[request_kv_cache],
+                        mode='decode', 
+                        device=device,
+                        treeTokens=1,
                     )
-                else:
-                    self.flashinferWrapper.prepareAttention(
-                        'decode', 
-                        batch_position,
-                        request_kv_cache.kvCachePool.page_len,
-                        "NONE",
-                        request_kv_cache.kvCachePool.cache_data[0].dtype,
-                    )
-                    logits = self(
-                        current_input,
-                        with_softmax=True,
-                        position_ids=current_pos_ids,
-                        kvCachePool=request_kv_cache.kvCachePool,
-                        batch_position=batch_position,
-                        mode='decode',
-                        flashinferWrapper=self.flashinferWrapper,
-                    )
-                
-                next_token = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
-                draft_ids.append(next_token)
-                kv_len += 1
-                
+                    
+                    # If graph captured, use decode_step
+                    if hasattr(self, "graph"):
+                        logits = self.decode_step(
+                            current_input,
+                            current_pos_ids,
+                            batch_position,
+                            self.kvCachePool
+                        )
+                    else:
+                        self.flashinferWrapper.prepareAttention(
+                            'decode', 
+                            batch_position,
+                            request_kv_cache.kvCachePool.page_len,
+                            "NONE",
+                            request_kv_cache.kvCachePool.cache_data[0].dtype,
+                        )
+                        logits = self(
+                            current_input,
+                            with_softmax=True,
+                            position_ids=current_pos_ids,
+                            kvCachePool=request_kv_cache.kvCachePool,
+                            batch_position=batch_position,
+                            mode='decode',
+                            flashinferWrapper=self.flashinferWrapper,
+                        )
+                    
+                    next_token = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
+                    draft_ids.append(next_token)
+                    kv_len += 1
+        
         return torch.cat(draft_ids, dim=-1)
