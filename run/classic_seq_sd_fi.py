@@ -44,13 +44,13 @@ class ClassicSeqFiBuilder(GeneratorPipelineBuilder):
         # Generator-specific configurations.
         self.generator_kwargs = {
             "prefill_chunk_size": 4096,
-            "limit_output_length": 8192, # limit output length at least 8192 tokens, None: no limit by default
+            "limit_output_length": None, # limit output length at least 8192 tokens, None: no limit by default
+            "page_len": 32,
         }
-        # Sequence Decoding Params
         self.draft_params = DraftParams(
             temperature=1,
-            max_depth=5, # Speculate 5 tokens at a time
-            topk_len=1,  # Sequence decoding (no branching)
+            max_depth=5, 
+            topk_len=1,  # Sequence decoding 
         )
         
         # Recipe for quantization and offloading.
@@ -72,12 +72,12 @@ class ClassicSeqFiBuilder(GeneratorPipelineBuilder):
             else:
                 raise ValueError("max_length should be set for static cache.")
             
-            past_key_values = FlashInferCache(target_model.config, max_tokens=max_cache_len, PAGE_LEN=32).kvCachePool
+            past_key_values = FlashInferCache(target_model.config, max_tokens=max_cache_len, PAGE_LEN=self.generator_kwargs["page_len"]).kvCachePool
         else:
             # Create dynamic kv-cache
             past_key_values = create_kv_cache("dynamic")
             
-        draft_past_key_values = FlashInferCache(draft_model.config, max_tokens=max_cache_len, PAGE_LEN=32).kvCachePool
+        draft_past_key_values = FlashInferCache(draft_model.config, max_tokens=max_cache_len, PAGE_LEN=self.generator_kwargs["page_len"]).kvCachePool
         return past_key_values, draft_past_key_values
 
     def load_draft_model(self, target_model, tokenizer, draft_model_path):

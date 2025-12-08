@@ -41,7 +41,8 @@ class NaiveBuilder(GeneratorPipelineBuilder):
         # Generator-specific configurations.
         self.generator_kwargs = {
             "prefill_chunk_size": 4096,
-            "limit_output_length": 8192, # limit output length at least 8192 tokens, None: no limit by default
+            "limit_output_length": None, # limit output length at least 8192 tokens, None: no limit by default
+            "page_len": 32,
         }
         
         # Recipe for quantization and offloading.
@@ -66,7 +67,7 @@ class NaiveBuilder(GeneratorPipelineBuilder):
                 raise ValueError("max_length should be set for static cache.")
             
             # Initialize FlashInfer KV Pool for Target Model
-            past_key_values = FlashInferCache(target_model.config, max_tokens=max_cache_len, PAGE_LEN=32).kvCachePool
+            past_key_values = FlashInferCache(target_model.config, max_tokens=max_cache_len, PAGE_LEN=self.generator_kwargs["page_len"]).kvCachePool
         else:
             # Fallback to dynamic if needed (though NaiveGenerator now expects Pool)
             past_key_values = create_kv_cache("dynamic")

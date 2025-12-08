@@ -3,6 +3,7 @@ from transformers.generation.logits_process import LogitsProcessorList
 from transformers.generation.stopping_criteria import StoppingCriteria
 import logging
 import nvtx
+import math 
 
 from .base import GeneratorBase
 from ..utils.mixin import SDProfilingMixin
@@ -20,6 +21,7 @@ class TargetkvSeqFiGeneratorBase(GeneratorBase):
         self.generator_kwargs = generator_kwargs or {}
         self.prefill_chunk_size = self.generator_kwargs.get("prefill_chunk_size", None)
         self.limit_output_length = generator_kwargs.get("limit_output_length", None)
+        self.page_len = self.generator_kwargs.get("page_len", 32)
 
     def init_cuda_graph_runner(self, device, kvCachePool=None):
         """
@@ -27,21 +29,6 @@ class TargetkvSeqFiGeneratorBase(GeneratorBase):
         """
         if hasattr(self.draft_model, 'init_cuda_graph_runner') and callable(self.draft_model.init_cuda_graph_runner):
             self.draft_model.init_cuda_graph_runner(device=device)
-    
-    def _truncate_cache(self, request_kv_cache, target_len):
-        """
-        Efficiently truncates the cache to target_len.
-        """
-        # Primary method: crop (now fixed in cache_manager to handle pages correctly)
-        if hasattr(request_kv_cache, 'crop'):
-            request_kv_cache.crop(target_len)
-        else:
-            # Fallback
-            current_len = request_kv_cache.get_seq_length()
-            if isinstance(current_len, torch.Tensor):
-                current_len = current_len.item()
-            if current_len > target_len:
-                request_kv_cache.decrement(current_len - target_len)
 
     def _speculate(self, input_ids, request_kv_cache):
         return self.draft_model.speculate(
@@ -60,7 +47,7 @@ class TargetkvSeqFiGeneratorBase(GeneratorBase):
             if target_start_offset < 0: target_start_offset = 0
             
             # 1. Truncate/Align Cache to target_start_offset
-            self._truncate_cache(request_kv_cache, target_start_offset)
+            request_kv_cache.crop(target_start_offset)
             
             rollback_start_offset = target_start_offset
 
@@ -130,6 +117,135 @@ class TargetkvSeqFiGeneratorBase(GeneratorBase):
         seq_len = draft_ids.shape[1] - 1
         
         return sampled_tokens, valid_indices, (seq_len, accept_len)
+
+    def _compute_spec_attention(self, request_kv_cache, prefix_len):
+        """
+        Calculates attention scores between draft tokens (Q_rope) and the prefix KV cache (K).
+        Aggregates the scores by averaging over layers, heads, and draft tokens.
+        
+        Returns:
+            torch.Tensor: The indices of the top-k physical pages with the highest aggregated attention scores.
+        """
+        # 1. Retrieve Q_rope from the draft model
+        captured_q = getattr(self.draft_model, 'latest_captured_rope_queries', None)
+        
+        if captured_q is None:
+            return None
+
+        if not hasattr(self.draft_model, 'important_layers') or not hasattr(self.draft_model, 'important_heads'):
+            return None
+
+        important_layers = self.draft_model.important_layers
+        important_heads = self.draft_model.important_heads
+        
+        num_q_heads = self.target_model.config.num_attention_heads
+        num_kv_heads = self.target_model.config.num_key_value_heads
+        gqa_group_size = num_q_heads // num_kv_heads
+        
+        # captured_q shape: [Steps, Layers, Batch(1), Heads, Dim]
+        # We assume Batch=1 as per your assertions elsewhere
+        num_steps, num_layers_captured, _, num_heads_captured, head_dim = captured_q.shape
+        
+        # Accumulator for final attention weights on the prefix [prefix_len]
+        final_scores_sum = torch.zeros(prefix_len, device=captured_q.device, dtype=torch.float32)
+        total_groups_count = 0 
+
+        # Get all page indices
+        page_indices = request_kv_cache.kv_page_indices
+        page_indices_tensor = torch.tensor(
+            page_indices,
+            device=captured_q.device,
+            dtype=torch.long
+        )
+        
+        PAGE_CHUNK_SIZE = 512
+
+        # 2. Iterate through each captured layer
+        for i, layer_idx in enumerate(important_layers):
+            layer_idx = int(layer_idx)
+            current_heads_indices = important_heads[i] 
+            kv_heads_indices = current_heads_indices // gqa_group_size
+
+            # Prepare Q: [Steps, Heads, Dim] -> [Heads, Steps, Dim]
+            q_layer = captured_q[:, i, 0, :, :]
+            q_perm = q_layer.permute(1, 0, 2)
+
+            # scaling = 1.0 / sqrt(head_dim)
+            q_perm = q_perm * (head_dim ** -0.5)
+
+            layer_logits_list = []
+            
+            # layer_cache_data shape: [Max_Pages, 2, Page_Len, KV_Heads, Dim]
+            # keys_view shape: [Max_Pages, Page_Len, KV_Heads, Dim]
+            keys_view = request_kv_cache.kvCachePool.cache_data[layer_idx][:, 0]
+            
+            num_pages = len(page_indices_tensor)
+            for start_page_idx in range(0, num_pages, PAGE_CHUNK_SIZE):
+                end_page_idx = min(start_page_idx + PAGE_CHUNK_SIZE, num_pages)
+                chunk_page_indices = page_indices_tensor[start_page_idx:end_page_idx]
+                
+                # Shape: [Chunk_Pages, Page_Len, KV_Heads, Dim]
+                k_chunk = keys_view.index_select(0, chunk_page_indices)
+                
+                # Flatten pages: [Chunk_Seq, KV_Heads, Dim]
+                # Use reshape (fast view) since data layout allows merging dim 0 and 1
+                k_chunk_flat = k_chunk.reshape(-1, num_kv_heads, head_dim)
+                
+                # GQA Expansion: Select KV heads corresponding to Q heads
+                # Shape: [Chunk_Seq, Q_Heads, Dim]
+                k_chunk_sel = k_chunk_flat.index_select(1, kv_heads_indices)
+                
+                # Permute for Matmul: [Q_Heads, Dim, Chunk_Seq]
+                k_chunk_perm = k_chunk_sel.permute(1, 2, 0)
+                
+                # Compute Logits
+                # [Heads, Steps, Dim] @ [Heads, Dim, Chunk_Seq] -> [Heads, Steps, Chunk_Seq]
+                chunk_logits = torch.matmul(q_perm, k_chunk_perm)
+                
+                layer_logits_list.append(chunk_logits)
+            
+            if not layer_logits_list:
+                continue
+            
+            full_layer_logits = torch.cat(layer_logits_list, dim=-1)
+
+            # Truncate to exact prefix_len
+            if full_layer_logits.size(-1) > prefix_len:
+                full_layer_logits = full_layer_logits[..., :prefix_len]
+                        
+            # Apply Softmax
+            attn_weights = torch.softmax(full_layer_logits, dim=-1)
+            
+            # Aggregate
+            final_scores_sum += attn_weights.sum(dim=(0, 1))
+            total_groups_count += (attn_weights.shape[0] * attn_weights.shape[1])
+
+        if total_groups_count == 0:
+            return None
+
+        avg_token_scores = final_scores_sum / total_groups_count
+
+        # --- Top-K Page Selection Logic ---
+        target_kv_size = self.generator_kwargs.get("Target_KV_size", 512)
+        k_pages = math.ceil(target_kv_size / self.page_len )
+        num_current_pages = len(page_indices)
+        
+        if num_current_pages <= k_pages:
+            return page_indices_tensor
+            
+        padded_len = num_current_pages * self.page_len 
+        if avg_token_scores.size(0) < padded_len:
+            padding_size = padded_len - avg_token_scores.size(0)
+            padding = torch.zeros(padding_size, device=avg_token_scores.device, dtype=avg_token_scores.dtype)
+            padded_scores = torch.cat([avg_token_scores, padding])
+        else:
+            padded_scores = avg_token_scores
+            
+        page_scores = padded_scores.reshape(num_current_pages, self.page_len).sum(dim=1)
+        topk_vals, topk_logical_indices = torch.topk(page_scores, k=k_pages)
+        selected_physical_pages = page_indices_tensor.index_select(0, topk_logical_indices)
+        
+        return selected_physical_pages
 
     def _generate(
         self,
@@ -253,6 +369,10 @@ class TargetkvSeqFiGeneratorBase(GeneratorBase):
                 with nvtx.annotate("speculate", color="cyan"):
                     draft_ids = self._speculate(input_ids, draft_request_kv_cache)
 
+                # calculate draft attention score to get topk pages
+                with nvtx.annotate("get topk pages", color="purple"):
+                    topk_page_indices = self._compute_spec_attention(draft_request_kv_cache, input_ids.shape[1])
+
                 # * verify forward
                 with nvtx.annotate("verify forward", color="orange"):
                     target_logits, rollback_start_offset = self._tree_decoding(draft_ids, request_kv_cache, cache_position, input_ids.device)
@@ -278,11 +398,11 @@ class TargetkvSeqFiGeneratorBase(GeneratorBase):
                     
                     # Rollback Target Cache
                     final_target_len = rollback_start_offset + new_tokens.shape[1]
-                    self._truncate_cache(request_kv_cache, final_target_len)
+                    request_kv_cache.crop(final_target_len)
                     
                     # Rollback Draft Cache
                     desired_draft_len = input_ids.shape[1] - 1
-                    self._truncate_cache(draft_request_kv_cache, desired_draft_len)
+                    draft_request_kv_cache.crop(desired_draft_len)
 
                 # * check stopping criteria
                 with nvtx.annotate("stopping criteria"):

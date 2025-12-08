@@ -353,6 +353,4 @@ class TargetkvSeqFiDraftModel(DraftModelBase):
                     draft_ids.append(next_token)
                     kv_len += 1
         
-        print("self.latest_captured_rope_queries.shape:", self.latest_captured_rope_queries.shape)
-
         return torch.cat(draft_ids, dim=-1)

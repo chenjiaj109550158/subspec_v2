@@ -45,15 +45,16 @@ class TargetkvSeqFiBuilder(GeneratorPipelineBuilder):
         self.generator_kwargs = {
             "prefill_chunk_size": 4096,
             "limit_output_length": None, # limit output length at least 8192 tokens, None: no limit by default
+            "page_len": 32,
             "Target_KV_size": 512,
             "window_size": 16,
             "SRH_path": "specdecodes/models/utils/compresskv/scores",
 
             # --- SR head select parameters ---
-            "SRH_head_num": 4,
+            "SRH_head_num": 8,
             # --- SRH layer select parameters ---
             "SRH_select_method": "SRH_score_agg", # layer_budget, SRH_score_agg
-            "SRH_layer_num": 1,
+            "SRH_layer_num": 2,
             # --- SRH score agg method parameters ---
             "SRH_score_agg_num": 4,
         }
@@ -82,12 +83,12 @@ class TargetkvSeqFiBuilder(GeneratorPipelineBuilder):
             else:
                 raise ValueError("max_length should be set for static cache.")
             
-            past_key_values = FlashInferCache(target_model.config, max_tokens=max_cache_len, PAGE_LEN=32).kvCachePool
+            past_key_values = FlashInferCache(target_model.config, max_tokens=max_cache_len, PAGE_LEN=self.generator_kwargs["page_len"]).kvCachePool
         else:
             # Create dynamic kv-cache
             past_key_values = create_kv_cache("dynamic")
             
-        draft_past_key_values = FlashInferCache(draft_model.config, max_tokens=max_cache_len, PAGE_LEN=32).kvCachePool
+        draft_past_key_values = FlashInferCache(draft_model.config, max_tokens=max_cache_len, PAGE_LEN=self.generator_kwargs["page_len"]).kvCachePool
         return past_key_values, draft_past_key_values
 
     def load_draft_model(self, target_model, tokenizer, draft_model_path):
