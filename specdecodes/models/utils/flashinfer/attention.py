@@ -50,6 +50,8 @@ class FiLlamaAttention(nn.Module):
         attention_mask: Optional[torch.Tensor],
         past_key_value: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        capture_storage: Optional[List[torch.Tensor]] = None, 
+        important_heads: Optional[torch.Tensor] = None,       
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         
@@ -69,6 +71,10 @@ class FiLlamaAttention(nn.Module):
 
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+        if capture_storage is not None and important_heads is not None:
+            filtered = query_states.index_select(1, important_heads)
+            capture_storage.append(filtered.detach())
 
         query = query_states.transpose(1, 2).contiguous()
         key = key_states.transpose(1, 2).contiguous()

@@ -2,6 +2,8 @@ import torch
 from typing import Optional, Union, TYPE_CHECKING
 from transformers.models.llama.modeling_llama import apply_rotary_pos_emb
 
+# TODO: Add Qwen2.5, Qwen3, maybe Mistral
+
 if TYPE_CHECKING:
     class TargetKVSDDraftModel:
         latest_captured_queries: Union[list, torch.Tensor]
@@ -49,41 +51,17 @@ class CaptureAttentionContext:
         original_forward = module.forward
         self.original_instance_forwards[module] = original_forward
         
-        # Closure context
-        ctx_layer_idx = layer_idx
         ctx_head_idx = self.layer_to_idx[layer_idx]
         dm = self.draft_model
 
         def patched_forward(hidden_states, *args, **kwargs):
-            # LlamaAttention/FlashInfer arg structure: (hidden, pos_emb, ...) or kwargs
-            position_embeddings = args[0] if args else kwargs.get("position_embeddings")
-
-            if dm._capture_enabled and position_embeddings is not None:
-                # 1. Compute Q (Llama standard)
-                input_shape = hidden_states.shape[:-1]
-                hidden_shape = (*input_shape, -1, module.head_dim)
-                query_states = module.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-
-                # 2. Compute K (Llama standard - needed for RoPE api)
-                key_states = module.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-
-                # 3. Apply RoPE
-                # Note: cache_position might be in kwargs
-                q_rope, _ = apply_rotary_pos_emb(
-                    query_states, 
-                    key_states, 
-                    position_embeddings[0], # cos 
-                    position_embeddings[1], # sin
-                    position_ids=kwargs.get("cache_position")
-                )
-
-                # 4. Filter Specific Heads
-                head_indices = dm.important_heads[ctx_head_idx]
-                if head_indices.device != q_rope.device:
-                    head_indices = head_indices.to(q_rope.device)
+            if dm._capture_enabled:
+                current_heads = dm.important_heads[ctx_head_idx]
+                if current_heads.device != hidden_states.device:
+                    current_heads = current_heads.to(hidden_states.device)
                 
-                filtered_rope = q_rope.index_select(1, head_indices)
-                dm.latest_captured_rope_queries.append(filtered_rope.detach().clone())
+                kwargs['capture_storage'] = dm.latest_captured_rope_queries
+                kwargs['important_heads'] = current_heads
 
             return original_forward(hidden_states, *args, **kwargs)
 
